@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: cafis-academia
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /api/health
+    disk:
+      name: cafis-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: CAFIS_DB_PATH
+        value: /var/data/cafis_academia.db
+      - key: CAFIS_COOKIE_SECURE
+        value: "1"
+      - key: CAFIS_ADMIN_EMAIL
+        sync: false
+      - key: CAFIS_ADMIN_PASSWORD
+        sync: false

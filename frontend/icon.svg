@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <rect width="512" height="512" rx="72" fill="#0f7b4f"/>
+  <path fill="#fff" d="M128 236h256v40H128zM82 206h36v100H82zM394 206h36v100h-36zM44 228h28v56H44zM440 228h28v56h-28z"/>
+  <text x="256" y="374" text-anchor="middle" font-family="Arial, sans-serif" font-size="70" font-weight="800" fill="#fff">CAFIS</text>
+</svg>

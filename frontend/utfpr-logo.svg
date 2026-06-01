@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 390" role="img" aria-label="UTFPR Universidade Tecnológica Federal do Paraná">
+  <rect width="1000" height="390" fill="none"/>
+  <g fill="#1f1c21">
+    <path d="M8 20h65v210c0 42 25 64 67 64s66-22 66-64V20h64v214c0 78-50 113-130 113S8 312 8 234V20z"/>
+    <path d="M268 20h390v63H418v255h-76V83h-74z"/>
+    <path d="M498 148h162v52h-98v138h-64z"/>
+    <path d="M684 148h86c61 0 93 30 93 84s-33 86-94 86h-21v20h-64V148zm64 54v62h22c20 0 31-11 31-31s-11-31-31-31h-22z"/>
+    <path d="M840 148h92c58 0 91 29 91 80 0 32-13 56-39 69l48 41h-83l-36-35h-10v35h-63V148zm63 52v54h27c19 0 30-10 30-27s-11-27-30-27h-27z"/>
+  </g>
+  <path fill="#ffcc00" d="M418 83h240v65H483v190h-65z"/>
+  <text x="8" y="386" font-family="Arial, Helvetica, sans-serif" font-size="38" font-weight="800" fill="#1f1c21" letter-spacing="1">
+    UNIVERSIDADE TECNOLÓGICA FEDERAL DO PARANÁ
+  </text>
+</svg>

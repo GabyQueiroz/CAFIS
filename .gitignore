@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+cafis_academia.db
+*.db
+.env

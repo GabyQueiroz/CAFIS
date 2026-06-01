@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0f7b4f">
+  <title>CAFIS Academia</title>
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="stylesheet" href="/style.css?v=4">
+</head>
+<body>
+  <main id="login" class="login-shell">
+    <section class="login-copy">
+      <p class="eyebrow">CAFIS UTFPR PG</p>
+      <h1>Academia, presenças e evolução em um só lugar.</h1>
+      <p>Controle seguro para estagiários e uma área clara para alunos acompanharem bioimpedância, treinos, horas e certificados.</p>
+    </section>
+    <section class="login-panel">
+      <div>
+        <p class="eyebrow">Acesso</p>
+        <h2>Entrar no sistema</h2>
+        <p class="muted">Use seu e-mail aprovado pela equipe CAFIS.</p>
+      </div>
+      <form id="loginForm" class="stack">
+        <label>E-mail<input name="email" type="email" autocomplete="email" required></label>
+        <label>Senha<input name="password" type="password" autocomplete="current-password" required></label>
+        <button class="primary" type="submit">Entrar</button>
+        <p id="loginMsg" class="message"></p>
+      </form>
+      <details class="signup-box">
+        <summary>Sou aluno e quero me cadastrar</summary>
+        <form id="publicRegisterForm" class="stack">
+          <label>Nome completo<input name="name" required></label>
+          <label>E-mail institucional<input name="email" type="email" required></label>
+          <div class="mini-grid">
+            <label>CPF<input name="cpf" minlength="11" required></label>
+            <label>RA/matricula<input name="registration" required></label>
+          </div>
+          <div class="mini-grid">
+            <label>Telefone<input name="phone"></label>
+            <label>Nascimento<input name="birth_date" type="date"></label>
+          </div>
+          <label>Objetivo
+            <select name="goal">
+              <option value="saude">Saúde</option>
+              <option value="emagrecimento">Emagrecimento</option>
+              <option value="hipertrofia">Hipertrofia</option>
+              <option value="condicionamento">Condicionamento</option>
+            </select>
+          </label>
+          <div class="mini-grid">
+            <label>Dias pretendidos<input name="availability_days" value="seg,qua,sex"></label>
+            <label>Min/semana<input name="weekly_minutes" type="number" value="180" min="30" max="900"></label>
+          </div>
+          <label>Senha<input name="password" type="password" minlength="8" required></label>
+          <button class="secondary" type="submit">Enviar solicitacao</button>
+          <p id="publicRegisterMsg" class="message"></p>
+        </form>
+      </details>
+    </section>
+  </main>
+
+  <section id="app" class="app hidden">
+    <aside class="sidebar">
+      <div>
+        <p class="eyebrow">CAFIS</p>
+        <h2>Academia</h2>
+      </div>
+      <nav id="nav"></nav>
+      <button id="logoutBtn" class="ghost" onclick="logout()">Sair</button>
+    </aside>
+    <main class="workspace">
+      <header class="topbar">
+        <div>
+          <p id="roleLabel" class="eyebrow"></p>
+          <h1 id="pageTitle">Painel</h1>
+        </div>
+        <div id="userBadge" class="badge"></div>
+      </header>
+      <div id="view"></div>
+    </main>
+  </section>
+
+  <dialog id="modal">
+    <div class="modal-card">
+      <button class="icon-close" type="button" aria-label="Fechar" onclick="document.getElementById('modal').close()">x</button>
+      <div id="modalBody"></div>
+    </div>
+  </dialog>
+
+  <script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.min.js"></script>
+  <script src="/script.js?v=14"></script>
+  <script>
+    if ("serviceWorker" in navigator) navigator.serviceWorker.register("/sw.js").catch(() => {});
+    document.getElementById("publicRegisterForm")?.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const form = event.currentTarget;
+      const msg = document.getElementById("publicRegisterMsg");
+      const data = Object.fromEntries(new FormData(form).entries());
+      data.weekly_minutes = Number(data.weekly_minutes);
+      msg.textContent = "";
+      try {
+        const res = await fetch("/api/auth/register", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(data)
+        });
+        const body = await res.json();
+        if (!res.ok) throw new Error(body.detail || "Não foi possível solicitar cadastro.");
+        msg.style.color = "#0d7a53";
+        msg.textContent = body.message;
+        form.reset();
+      } catch (error) {
+        msg.style.color = "";
+        msg.textContent = error.message;
+      }
+    });
+  </script>
+</body>
+</html>
