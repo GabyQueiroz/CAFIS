@@ -36,8 +36,14 @@ def now_iso() -> str:
 
 
 def connect() -> sqlite3.Connection:
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
+    db_path = DB_PATH
+    try:
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+    except PermissionError:
+        db_path = Path(os.getenv("CAFIS_FALLBACK_DB_PATH", "/tmp/cafis_academia.db"))
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        print(f"WARNING: sem permissao para {DB_PATH}; usando banco temporario em {db_path}")
+    conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
