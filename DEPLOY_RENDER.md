@@ -8,6 +8,7 @@ Ele cria um Web Service Python com:
 
 - build: `pip install -r requirements.txt`
 - start: `uvicorn app:app --host 0.0.0.0 --port $PORT`
+- Python: `3.11.11`
 - banco SQLite em disco persistente: `/var/data/cafis_academia.db`
 - health check: `/api/health`
 
