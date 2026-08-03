@@ -75,9 +75,22 @@ def rowdict(row: sqlite3.Row | None) -> dict[str, Any] | None:
     return dict(row) if row else None
 
 
-def ensure_admin_user(db: sqlite3.Connection, name: str, email: str, password: str, notes: str) -> None:
+def ensure_admin_user(
+    db: sqlite3.Connection,
+    name: str,
+    email: str,
+    password: str,
+    notes: str,
+    update_password: bool = False,
+) -> None:
     admin_email = normalize_email(email)
-    if db.execute("SELECT id FROM users WHERE email = ?", (admin_email,)).fetchone():
+    existing = db.execute("SELECT id FROM users WHERE email = ?", (admin_email,)).fetchone()
+    if existing:
+        if update_password:
+            db.execute(
+                "UPDATE users SET password_hash=?, active=1, role='admin' WHERE id=?",
+                (hash_password(password), existing["id"]),
+            )
         return
     db.execute(
         """
@@ -317,6 +330,7 @@ def init_db() -> None:
             os.getenv("CAFIS_ADMIN_EMAIL", "admin@cafis.utfpr.edu.br"),
             os.getenv("CAFIS_ADMIN_PASSWORD", "Admin@12345"),
             "Troque a senha antes de publicar.",
+            update_password=bool(os.getenv("CAFIS_ADMIN_PASSWORD")),
         )
         ensure_admin_user(
             db,
@@ -324,6 +338,7 @@ def init_db() -> None:
             os.getenv("CAFIS_CAFIS_ADMIN_EMAIL", "adm.cafis@utfpr.edu.br"),
             os.getenv("CAFIS_CAFIS_ADMIN_PASSWORD", "CAFIS@2026"),
             "Administrador de bootstrap do CAFIS. Troque a senha no Render.",
+            update_password=bool(os.getenv("CAFIS_CAFIS_ADMIN_PASSWORD")),
         )
         for name, category in [
             ("Esteira", "cardio"),
