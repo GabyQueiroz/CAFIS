@@ -132,9 +132,11 @@ async function render(view) {
 }
 
 async function adminHome() {
-  setTitle("Painel dos estagiários");
+  setTitle("Painel dos projetos");
   const o = await api("/api/admin/overview");
   const pendingRows = await api("/api/admin/pending-students");
+  const programs = await api("/api/programs");
+  const classes = await api("/api/classes");
   $("#view").innerHTML = `
     <section class="grid three">
       <div class="card metric"><span class="muted">Alunos ativos</span><strong>${o.students}</strong></div>
@@ -142,10 +144,22 @@ async function adminHome() {
       <div class="card metric"><span class="muted">Horas registradas</span><strong>${o.total_hours}</strong></div>
     </section>
     <section class="grid two" style="margin-top:16px">
+      ${programs.map(program => {
+        const totalClasses = classes.filter(c => c.program_id === program.id).length;
+        return `<div class="card">
+          <p class="eyebrow">Projeto</p>
+          <h2>${esc(program.name)}</h2>
+          <p class="muted">${esc(program.description || "")}</p>
+          <p><strong>${totalClasses}</strong> turma(s) cadastrada(s)</p>
+          <button class="primary" onclick="render('classes')">Gerenciar turmas</button>
+        </div>`;
+      }).join("")}
+    </section>
+    <section class="grid two" style="margin-top:16px">
       <div class="card">
         <h2>Operação de hoje</h2>
-        <p class="muted">Lance entrada e saída pelo nome do aluno. As horas entram automaticamente no histórico e no certificado.</p>
-        <div class="row"><button class="primary" onclick="render('attendance')">Lançar presença</button><button class="secondary" onclick="render('students')">Gerenciar alunos</button></div>
+        <p class="muted">Para academia, lance entrada e saída. Para natação e turmas, use a aba Turmas e abra a chamada da data.</p>
+        <div class="row"><button class="primary" onclick="render('classes')">Abrir turmas</button><button class="secondary" onclick="render('attendance')">Presença da academia</button></div>
       </div>
       <div class="card">
         <h2>Solicitações de cadastro</h2>
