@@ -12,6 +12,10 @@ Sistema web responsivo para gerenciamento da academia do CAFIS.
 - Scanner por camera para estagiarios/admin registrarem entrada e saida.
 - Controle de horas e certificado imprimivel.
 - Equipamentos, manutencao, emails/recados e historico com graficos.
+- Projetos e turmas para Academia e Natacao.
+- Cadastro individual ou por planilha CSV/XLSX.
+- Chamada por aula/data com presenca, falta e falta justificada.
+- Certificado por aluno ou por turma/projeto.
 
 ## Rodar localmente
 
@@ -31,6 +35,16 @@ Login inicial:
 - Senha: `Admin@12345`
 
 Troque antes de publicar usando variaveis de ambiente.
+
+## Importacao por planilha
+
+Use CSV ou XLSX com cabecalhos:
+
+```text
+nome,email,cpf,matricula,telefone,nascimento,senha,observacoes
+```
+
+Existe um exemplo em `modelo_importacao_alunos.csv`.
 
 ## Publicacao segura
 

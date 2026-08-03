@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import csv
 import hashlib
 import hmac
 import io
@@ -14,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 import qrcode
-from fastapi import Cookie, Depends, FastAPI, HTTPException, Response
+from fastapi import Cookie, Depends, FastAPI, File, HTTPException, Response, UploadFile
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -171,8 +172,61 @@ def init_db() -> None:
                 status TEXT NOT NULL,
                 created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS programs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                slug TEXT NOT NULL UNIQUE,
+                description TEXT DEFAULT '',
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS class_groups (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                program_id INTEGER NOT NULL REFERENCES programs(id) ON DELETE CASCADE,
+                name TEXT NOT NULL,
+                schedule TEXT DEFAULT '',
+                teacher TEXT DEFAULT '',
+                default_minutes INTEGER NOT NULL DEFAULT 60,
+                location TEXT DEFAULT '',
+                notes TEXT DEFAULT '',
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS enrollments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                class_id INTEGER NOT NULL REFERENCES class_groups(id) ON DELETE CASCADE,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                created_at TEXT NOT NULL,
+                UNIQUE(class_id, user_id)
+            );
+            CREATE TABLE IF NOT EXISTS class_sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                class_id INTEGER NOT NULL REFERENCES class_groups(id) ON DELETE CASCADE,
+                session_date TEXT NOT NULL,
+                notes TEXT DEFAULT '',
+                created_at TEXT NOT NULL,
+                UNIQUE(class_id, session_date)
+            );
+            CREATE TABLE IF NOT EXISTS class_attendance (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id INTEGER NOT NULL REFERENCES class_sessions(id) ON DELETE CASCADE,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                status TEXT NOT NULL CHECK(status IN ('present','absent','justified')),
+                minutes INTEGER NOT NULL DEFAULT 0,
+                notes TEXT DEFAULT '',
+                registered_at TEXT NOT NULL,
+                UNIQUE(session_id, user_id)
+            );
             """
         )
+        for name, slug, description in [
+            ("Academia", "academia", "Controle de alunos, avaliações, presenças e horas da academia CAFIS."),
+            ("Natação", "natacao", "Controle de turmas, chamadas, horas e certificados do projeto de natação."),
+        ]:
+            if not db.execute("SELECT id FROM programs WHERE slug=?", (slug,)).fetchone():
+                db.execute(
+                    "INSERT INTO programs (name, slug, description, created_at) VALUES (?, ?, ?, ?)",
+                    (name, slug, description, now_iso()),
+                )
         eval_cols = db.execute("PRAGMA table_info(evaluations)").fetchall()
         eval_info = {row["name"]: row for row in eval_cols}
         weight_col = eval_info.get("weight")
@@ -361,6 +415,36 @@ class MessageIn(BaseModel):
     body: str = Field(min_length=3, max_length=5000)
     recipient_id: int | None = None
     send_to_all: bool = False
+
+
+class ClassIn(BaseModel):
+    program_id: int
+    name: str = Field(min_length=2, max_length=120)
+    schedule: str = ""
+    teacher: str = ""
+    default_minutes: int = Field(default=60, ge=1, le=600)
+    location: str = ""
+    notes: str = ""
+
+
+class ClassStudentIn(StudentIn):
+    user_id: int | None = None
+
+
+class ClassSessionIn(BaseModel):
+    session_date: str = Field(min_length=8, max_length=20)
+    notes: str = ""
+
+
+class AttendanceItemIn(BaseModel):
+    user_id: int
+    status: str = Field(pattern="^(present|absent|justified)$")
+    minutes: int = Field(default=0, ge=0, le=600)
+    notes: str = ""
+
+
+class AttendanceBulkIn(BaseModel):
+    records: list[AttendanceItemIn]
 
 
 def current_user(session: str | None = Cookie(default=None, alias=COOKIE_NAME)) -> dict[str, Any]:
@@ -831,13 +915,307 @@ def send_message(data: MessageIn, admin: dict[str, Any] = Depends(require_admin)
     return {"sent": results}
 
 
+def get_class_or_404(db: sqlite3.Connection, class_id: int) -> sqlite3.Row:
+    row = db.execute(
+        """
+        SELECT c.*, p.name program_name, p.slug program_slug
+        FROM class_groups c JOIN programs p ON p.id = c.program_id
+        WHERE c.id=? AND c.active=1
+        """,
+        (class_id,),
+    ).fetchone()
+    if not row:
+        raise HTTPException(404, "Turma não encontrada.")
+    return row
+
+
+def upsert_student_from_payload(db: sqlite3.Connection, data: dict[str, Any]) -> tuple[int, str | None]:
+    email = normalize_email(str(data.get("email") or ""))
+    if not email:
+        raise HTTPException(400, "E-mail do aluno é obrigatório.")
+    existing = db.execute("SELECT id FROM users WHERE email=?", (email,)).fetchone()
+    if existing:
+        return existing["id"], None
+    cpf = str(data.get("cpf") or "")
+    password = str(data.get("password") or (cpf[-4:] if len(cpf) >= 4 else secrets.token_urlsafe(6)))
+    cur = db.execute(
+        """
+        INSERT INTO users
+        (name,email,password_hash,role,cpf,registration,birth_date,phone,goal,availability_days,weekly_minutes,notes,qr_secret,active,created_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            str(data.get("name") or data.get("nome") or "").strip(),
+            email,
+            hash_password(password),
+            "student",
+            cpf,
+            str(data.get("registration") or data.get("matricula") or data.get("ra") or ""),
+            str(data.get("birth_date") or data.get("nascimento") or ""),
+            str(data.get("phone") or data.get("telefone") or ""),
+            str(data.get("goal") or "saude"),
+            str(data.get("availability_days") or data.get("dias") or ""),
+            int(data.get("weekly_minutes") or 180),
+            str(data.get("notes") or ""),
+            secrets.token_urlsafe(32),
+            1,
+            now_iso(),
+        ),
+    )
+    return int(cur.lastrowid), password
+
+
+@app.get("/api/programs")
+def programs(_: dict[str, Any] = Depends(require_admin)) -> list[dict[str, Any]]:
+    with connect() as db:
+        rows = db.execute(
+            """
+            SELECT p.*,
+                   (SELECT count(*) FROM class_groups c WHERE c.program_id=p.id AND c.active=1) class_count
+            FROM programs p ORDER BY p.name
+            """
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+@app.get("/api/classes")
+def classes(_: dict[str, Any] = Depends(require_admin)) -> list[dict[str, Any]]:
+    with connect() as db:
+        rows = db.execute(
+            """
+            SELECT c.*, p.name program_name,
+                   (SELECT count(*) FROM enrollments e WHERE e.class_id=c.id) student_count
+            FROM class_groups c JOIN programs p ON p.id=c.program_id
+            WHERE c.active=1 ORDER BY p.name, c.name
+            """
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+@app.post("/api/classes")
+def create_class(data: ClassIn, _: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
+    with connect() as db:
+        if not db.execute("SELECT id FROM programs WHERE id=?", (data.program_id,)).fetchone():
+            raise HTTPException(404, "Projeto não encontrado.")
+        cur = db.execute(
+            """
+            INSERT INTO class_groups
+            (program_id,name,schedule,teacher,default_minutes,location,notes,created_at)
+            VALUES (?,?,?,?,?,?,?,?)
+            """,
+            (data.program_id, data.name, data.schedule, data.teacher, data.default_minutes, data.location, data.notes, now_iso()),
+        )
+        row = rowdict(db.execute("SELECT * FROM class_groups WHERE id=?", (cur.lastrowid,)).fetchone())
+    return {"class": row}
+
+
+@app.put("/api/classes/{class_id}")
+def update_class(class_id: int, data: ClassIn, _: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
+    with connect() as db:
+        get_class_or_404(db, class_id)
+        db.execute(
+            """
+            UPDATE class_groups SET program_id=?, name=?, schedule=?, teacher=?,
+            default_minutes=?, location=?, notes=? WHERE id=?
+            """,
+            (data.program_id, data.name, data.schedule, data.teacher, data.default_minutes, data.location, data.notes, class_id),
+        )
+        row = rowdict(db.execute("SELECT * FROM class_groups WHERE id=?", (class_id,)).fetchone())
+    return {"class": row}
+
+
+@app.get("/api/classes/{class_id}/roster")
+def class_roster(class_id: int, _: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
+    with connect() as db:
+        class_row = rowdict(get_class_or_404(db, class_id))
+        students = [
+            public_user(dict(r)) for r in db.execute(
+                """
+                SELECT u.* FROM enrollments e JOIN users u ON u.id=e.user_id
+                WHERE e.class_id=? AND u.active=1 ORDER BY u.name
+                """,
+                (class_id,),
+            ).fetchall()
+        ]
+        sessions = [
+            dict(r) for r in db.execute(
+                "SELECT * FROM class_sessions WHERE class_id=? ORDER BY session_date DESC LIMIT 20",
+                (class_id,),
+            ).fetchall()
+        ]
+    return {"class": class_row, "students": students, "sessions": sessions}
+
+
+@app.post("/api/classes/{class_id}/students")
+def add_class_student(class_id: int, data: ClassStudentIn, _: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
+    with connect() as db:
+        get_class_or_404(db, class_id)
+        if data.user_id:
+            user_id = data.user_id
+            initial_password = None
+            get_student_or_404(db, user_id)
+        else:
+            user_id, initial_password = upsert_student_from_payload(db, data.model_dump())
+        db.execute(
+            "INSERT OR IGNORE INTO enrollments (class_id,user_id,created_at) VALUES (?,?,?)",
+            (class_id, user_id, now_iso()),
+        )
+        student = rowdict(db.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone())
+    return {"student": public_user(student), "initial_password": initial_password}
+
+
+def read_students_table(upload: UploadFile, raw: bytes) -> list[dict[str, Any]]:
+    suffix = Path(upload.filename or "").suffix.lower()
+    if suffix == ".xlsx":
+        try:
+            from openpyxl import load_workbook
+        except Exception as exc:
+            raise HTTPException(500, "Dependência openpyxl não instalada.") from exc
+        wb = load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
+        ws = wb.active
+        rows = list(ws.iter_rows(values_only=True))
+        if not rows:
+            return []
+        headers = [str(v or "").strip().lower() for v in rows[0]]
+        return [
+            {headers[i]: row[i] for i in range(min(len(headers), len(row))) if headers[i]}
+            for row in rows[1:]
+            if any(cell not in (None, "") for cell in row)
+        ]
+    text = raw.decode("utf-8-sig")
+    reader = csv.DictReader(io.StringIO(text))
+    return [dict(row) for row in reader]
+
+
+@app.post("/api/classes/{class_id}/import")
+async def import_class_students(
+    class_id: int,
+    file: UploadFile = File(...),
+    _: dict[str, Any] = Depends(require_admin),
+) -> dict[str, Any]:
+    raw = await file.read()
+    rows = read_students_table(file, raw)
+    created = 0
+    enrolled = 0
+    failures: list[dict[str, Any]] = []
+    with connect() as db:
+        get_class_or_404(db, class_id)
+        for idx, row in enumerate(rows, start=2):
+            try:
+                normalized = {
+                    "name": row.get("nome") or row.get("name"),
+                    "email": row.get("email") or row.get("e-mail"),
+                    "cpf": row.get("cpf"),
+                    "registration": row.get("matricula") or row.get("matrícula") or row.get("ra") or row.get("registration"),
+                    "birth_date": row.get("nascimento") or row.get("birth_date"),
+                    "phone": row.get("telefone") or row.get("phone"),
+                    "password": row.get("senha") or row.get("password"),
+                    "notes": row.get("observacoes") or row.get("observações") or "",
+                }
+                user_id, initial_password = upsert_student_from_payload(db, normalized)
+                if initial_password:
+                    created += 1
+                before = db.total_changes
+                db.execute(
+                    "INSERT OR IGNORE INTO enrollments (class_id,user_id,created_at) VALUES (?,?,?)",
+                    (class_id, user_id, now_iso()),
+                )
+                if db.total_changes > before:
+                    enrolled += 1
+            except Exception as exc:
+                failures.append({"row": idx, "error": str(exc)})
+    return {"rows": len(rows), "created": created, "enrolled": enrolled, "failures": failures}
+
+
+@app.post("/api/classes/{class_id}/sessions")
+def create_class_session(class_id: int, data: ClassSessionIn, _: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
+    with connect() as db:
+        class_row = get_class_or_404(db, class_id)
+        cur = db.execute(
+            "INSERT OR IGNORE INTO class_sessions (class_id,session_date,notes,created_at) VALUES (?,?,?,?)",
+            (class_id, data.session_date, data.notes, now_iso()),
+        )
+        session_id = cur.lastrowid or db.execute(
+            "SELECT id FROM class_sessions WHERE class_id=? AND session_date=?",
+            (class_id, data.session_date),
+        ).fetchone()["id"]
+        students = db.execute(
+            "SELECT user_id FROM enrollments WHERE class_id=?",
+            (class_id,),
+        ).fetchall()
+        for student in students:
+            db.execute(
+                """
+                INSERT OR IGNORE INTO class_attendance
+                (session_id,user_id,status,minutes,registered_at)
+                VALUES (?,?,?,?,?)
+                """,
+                (session_id, student["user_id"], "absent", 0, now_iso()),
+            )
+        session = rowdict(db.execute("SELECT * FROM class_sessions WHERE id=?", (session_id,)).fetchone())
+    return {"class": dict(class_row), "session": session}
+
+
+@app.get("/api/sessions/{session_id}/attendance")
+def get_session_attendance(session_id: int, _: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
+    with connect() as db:
+        session = rowdict(db.execute("SELECT * FROM class_sessions WHERE id=?", (session_id,)).fetchone())
+        if not session:
+            raise HTTPException(404, "Aula não encontrada.")
+        class_row = rowdict(get_class_or_404(db, session["class_id"]))
+        rows = db.execute(
+            """
+            SELECT u.id user_id, u.name, u.email, u.registration,
+                   COALESCE(a.status, 'absent') status,
+                   COALESCE(a.minutes, 0) minutes,
+                   COALESCE(a.notes, '') notes
+            FROM enrollments e
+            JOIN users u ON u.id=e.user_id
+            LEFT JOIN class_attendance a ON a.user_id=u.id AND a.session_id=?
+            WHERE e.class_id=? AND u.active=1
+            ORDER BY u.name
+            """,
+            (session_id, session["class_id"]),
+        ).fetchall()
+    return {"class": class_row, "session": session, "attendance": [dict(r) for r in rows]}
+
+
+@app.post("/api/sessions/{session_id}/attendance")
+def save_session_attendance(session_id: int, data: AttendanceBulkIn, _: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
+    with connect() as db:
+        session = db.execute("SELECT * FROM class_sessions WHERE id=?", (session_id,)).fetchone()
+        if not session:
+            raise HTTPException(404, "Aula não encontrada.")
+        class_row = get_class_or_404(db, session["class_id"])
+        for record in data.records:
+            minutes = record.minutes if record.status == "present" else 0
+            if record.status == "present" and minutes == 0:
+                minutes = class_row["default_minutes"]
+            db.execute(
+                """
+                INSERT INTO class_attendance
+                (session_id,user_id,status,minutes,notes,registered_at)
+                VALUES (?,?,?,?,?,?)
+                ON CONFLICT(session_id,user_id) DO UPDATE SET
+                status=excluded.status,
+                minutes=excluded.minutes,
+                notes=excluded.notes,
+                registered_at=excluded.registered_at
+                """,
+                (session_id, record.user_id, record.status, minutes, record.notes, now_iso()),
+            )
+    return {"status": "ok", "saved": len(data.records)}
+
+
 @app.get("/api/certificates/{student_id}", response_class=HTMLResponse)
 def certificate(student_id: int, user: dict[str, Any] = Depends(current_user)) -> str:
     if user["role"] != "admin" and user["id"] != student_id:
         raise HTTPException(403, "Sem permissão.")
     with connect() as db:
         student = get_student_or_404(db, student_id)
-        minutes = db.execute("SELECT coalesce(sum(minutes),0) m FROM attendance WHERE user_id=?", (student_id,)).fetchone()["m"]
+        gym_minutes = db.execute("SELECT coalesce(sum(minutes),0) m FROM attendance WHERE user_id=?", (student_id,)).fetchone()["m"]
+        class_minutes = db.execute("SELECT coalesce(sum(minutes),0) m FROM class_attendance WHERE user_id=? AND status='present'", (student_id,)).fetchone()["m"]
+        minutes = gym_minutes + class_minutes
     hours = round(minutes / 60, 1)
     today = datetime.now().strftime("%d/%m/%Y")
     return f"""
@@ -877,6 +1255,64 @@ def certificate(student_id: int, user: dict[str, Any] = Depends(current_user)) -
           Chefe do CAFIS
         </div>
       </section>
+    <script>window.print()</script></main></body></html>
+    """
+
+
+@app.get("/api/certificates/classes/{class_id}/students/{student_id}", response_class=HTMLResponse)
+def class_certificate(class_id: int, student_id: int, user: dict[str, Any] = Depends(current_user)) -> str:
+    if user["role"] != "admin" and user["id"] != student_id:
+        raise HTTPException(403, "Sem permissão.")
+    with connect() as db:
+        class_row = get_class_or_404(db, class_id)
+        student = get_student_or_404(db, student_id)
+        enrolled = db.execute("SELECT id FROM enrollments WHERE class_id=? AND user_id=?", (class_id, student_id)).fetchone()
+        if not enrolled:
+            raise HTTPException(404, "Aluno não está matriculado nesta turma.")
+        minutes = db.execute(
+            """
+            SELECT coalesce(sum(a.minutes),0) m
+            FROM class_attendance a JOIN class_sessions s ON s.id=a.session_id
+            WHERE s.class_id=? AND a.user_id=? AND a.status='present'
+            """,
+            (class_id, student_id),
+        ).fetchone()["m"]
+        presences = db.execute(
+            """
+            SELECT count(*) c FROM class_attendance a JOIN class_sessions s ON s.id=a.session_id
+            WHERE s.class_id=? AND a.user_id=? AND a.status='present'
+            """,
+            (class_id, student_id),
+        ).fetchone()["c"]
+    hours = round(minutes / 60, 1)
+    today = datetime.now().strftime("%d/%m/%Y")
+    return f"""
+    <!doctype html><html lang="pt-BR"><meta charset="utf-8">
+    <title>Certificado CAFIS</title>
+    <style>
+      @page {{ size: A4 landscape; margin: 18mm; }}
+      * {{ box-sizing: border-box; }}
+      body {{ font-family: Arial, Helvetica, sans-serif; margin: 0; color: #17201a; background: #f5f7f6; }}
+      .cert {{ border: 10px solid #0f7b4f; padding: 34px 46px; min-height: calc(100vh - 36mm); background: white; }}
+      .header {{ display: flex; align-items: center; justify-content: space-between; gap: 24px; border-bottom: 2px solid #dce6e1; padding-bottom: 18px; }}
+      .logo {{ width: 300px; max-width: 38%; height: auto; }}
+      .org {{ text-align: right; font-size: 15px; line-height: 1.35; color: #405149; }}
+      h1 {{ font-size: 42px; margin: 40px 0 26px; text-align: center; }}
+      p {{ font-size: 22px; line-height: 1.65; }}
+      .date {{ margin-top: 30px; text-align: right; }}
+      .signatures {{ display: flex; justify-content: center; margin-top: 72px; }}
+      .sig {{ border-top: 1px solid #333; width: 430px; text-align: center; padding-top: 10px; font-size: 16px; line-height: 1.35; }}
+      .sig strong {{ display: block; font-size: 18px; }}
+    </style>
+    <body><main class="cert">
+      <header class="header">
+        <img class="logo" src="/utfpr-logo.svg" alt="UTFPR">
+        <div class="org">Universidade Tecnológica Federal do Paraná<br>Campus Ponta Grossa<br>CAFIS</div>
+      </header>
+      <h1>Certificado de Participação</h1>
+      <p>Certificamos que <strong>{student['name']}</strong> participou da turma <strong>{class_row['name']}</strong>, vinculada ao projeto <strong>{class_row['program_name']}</strong>, totalizando <strong>{hours} horas</strong> e <strong>{presences} presença(s)</strong> registradas no sistema CAFIS.</p>
+      <p class="date">Ponta Grossa, {today}.</p>
+      <section class="signatures"><div class="sig"><strong>Prof. José Alves Faria Filho</strong>Chefe do CAFIS</div></section>
     <script>window.print()</script></main></body></html>
     """
 

@@ -9,6 +9,11 @@ const api = async (url, options = {}) => {
   if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || "Erro na requisicao");
   return res.json();
 };
+const apiUpload = async (url, formData) => {
+  const res = await fetch(url, { method: "POST", credentials: "include", body: formData });
+  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || "Erro no envio");
+  return res.json();
+};
 
 const fmtDate = (v) => v ? new Date(v).toLocaleString("pt-BR") : "-";
 const setTitle = (title) => $("#pageTitle").textContent = title;
@@ -107,6 +112,7 @@ async function render(view) {
   if (state.user.role === "admin") {
     nav([
       { id: "admin", label: "Painel" },
+      { id: "classes", label: "Turmas" },
       { id: "students", label: "Alunos" },
       { id: "pending", label: "Solicitações" },
       { id: "attendance", label: "Presença" },
@@ -121,7 +127,7 @@ async function render(view) {
       { id: "myeval", label: "Nova avaliação" },
     ]);
   }
-  const routes = { admin: adminHome, students, pending, attendance, equipment, messages, student: studentHome, myqr, myevolution, myeval };
+  const routes = { admin: adminHome, classes: classesView, students, pending, attendance, equipment, messages, student: studentHome, myqr, myevolution, myeval };
   await routes[view]();
 }
 
@@ -147,6 +153,186 @@ async function adminHome() {
         <button class="secondary" onclick="render('pending')">Revisar solicitações</button>
       </div>
     </section>`;
+}
+
+async function classesView() {
+  setTitle("Turmas e projetos");
+  const programs = await api("/api/programs");
+  const classes = await api("/api/classes");
+  $("#view").innerHTML = `
+    <section class="grid two">
+      <div class="card">
+        <h2>Nova turma</h2>
+        <form id="classForm" class="stack">
+          <label>Projeto<select name="program_id">${programs.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join("")}</select></label>
+          <label>Nome da turma<input name="name" placeholder="Ex.: Natação 18h - Ter/Qui" required></label>
+          <label>Horário<input name="schedule" placeholder="Ex.: terças e quintas, 18h"></label>
+          <label>Professor(a)<input name="teacher" placeholder="Nome da professora/professor"></label>
+          <label>Minutos por aula<input name="default_minutes" type="number" value="60" min="1" max="600"></label>
+          <label>Local<input name="location" placeholder="Piscina, academia, quadra..."></label>
+          <label>Observações<textarea name="notes"></textarea></label>
+          <button class="primary">Criar turma</button>
+        </form>
+      </div>
+      <div class="card">
+        <h2>Projetos</h2>
+        <div class="grid">${programs.map(p => `<div class="notice"><strong>${esc(p.name)}</strong><br>${esc(p.description || "")}<br><span class="muted">${p.class_count} turma(s)</span></div>`).join("")}</div>
+      </div>
+    </section>
+    <section class="card" style="margin-top:16px">
+      <h2>Turmas cadastradas</h2>
+      <div class="student-list">
+        ${classes.length ? classes.map(c => `
+          <article class="student-row">
+            <div><strong>${esc(c.name)}</strong><span class="muted">${esc(c.program_name)} | ${esc(c.schedule || "Sem horário")} | ${esc(c.teacher || "Sem professor(a)")}</span></div>
+            <span class="pill ok">${c.student_count} aluno(s)</span>
+            <button class="secondary open-class-btn" data-id="${c.id}" type="button">Abrir</button>
+          </article>`).join("") : "<p class='muted'>Nenhuma turma cadastrada.</p>"}
+      </div>
+    </section>`;
+  $("#classForm").onsubmit = async (ev) => {
+    ev.preventDefault();
+    const data = Object.fromEntries(new FormData(ev.target).entries());
+    data.program_id = Number(data.program_id);
+    data.default_minutes = Number(data.default_minutes);
+    await api("/api/classes", { method: "POST", body: JSON.stringify(data) });
+    classesView();
+  };
+  document.querySelectorAll(".open-class-btn").forEach(btn => btn.onclick = () => openClass(Number(btn.dataset.id)));
+}
+
+async function openClass(classId) {
+  const data = await api(`/api/classes/${classId}/roster`);
+  setTitle(data.class.name);
+  $("#view").innerHTML = `
+    <section class="grid two">
+      <div class="card">
+        <h2>Turma</h2>
+        <p><strong>${esc(data.class.program_name)}</strong></p>
+        <p class="muted">Horário: ${esc(data.class.schedule || "-")}<br>Professor(a): ${esc(data.class.teacher || "-")}<br>Minutos/aula: ${esc(data.class.default_minutes)}</p>
+        <div class="row"><button class="secondary" onclick="classesView()">Voltar</button></div>
+      </div>
+      <div class="card">
+        <h2>Nova aula/chamada</h2>
+        <form id="sessionForm" class="stack">
+          <label>Data<input name="session_date" type="date" value="${new Date().toISOString().slice(0,10)}" required></label>
+          <label>Observações<textarea name="notes"></textarea></label>
+          <button class="primary">Criar chamada</button>
+        </form>
+      </div>
+    </section>
+    <section class="grid two" style="margin-top:16px">
+      <div class="card">
+        <h2>Cadastrar aluno individual</h2>
+        <form id="classStudentForm" class="stack">
+          <input name="name" placeholder="Nome completo" required>
+          <input name="email" type="email" placeholder="E-mail" required>
+          <input name="cpf" placeholder="CPF">
+          <input name="registration" placeholder="RA/matrícula">
+          <input name="phone" placeholder="Telefone">
+          <input name="password" placeholder="Senha inicial opcional">
+          <button class="primary">Cadastrar na turma</button>
+        </form>
+      </div>
+      <div class="card">
+        <h2>Importar planilha</h2>
+        <p class="muted">Aceita CSV ou XLSX com colunas: nome, email, cpf, matricula, telefone, nascimento, senha.</p>
+        <form id="importForm" class="stack">
+          <input name="file" type="file" accept=".csv,.xlsx" required>
+          <button class="primary">Importar alunos</button>
+        </form>
+        <div id="importResult"></div>
+      </div>
+    </section>
+    <section class="card" style="margin-top:16px">
+      <h2>Alunos da turma</h2>
+      ${classRosterTable(data.students, classId)}
+    </section>
+    <section class="card" style="margin-top:16px">
+      <h2>Chamadas recentes</h2>
+      <div class="student-list">
+      ${data.sessions.length ? data.sessions.map(s => `
+        <article class="student-row">
+          <div><strong>${fmtDate(s.session_date)}</strong><span class="muted">${esc(s.notes || "")}</span></div>
+          <span class="pill">Aula</span>
+          <button class="secondary open-session-btn" data-id="${s.id}" type="button">Abrir chamada</button>
+        </article>`).join("") : "<p class='muted'>Nenhuma chamada criada.</p>"}
+      </div>
+    </section>`;
+  $("#sessionForm").onsubmit = async (ev) => {
+    ev.preventDefault();
+    const body = Object.fromEntries(new FormData(ev.target).entries());
+    const res = await api(`/api/classes/${classId}/sessions`, { method: "POST", body: JSON.stringify(body) });
+    openSession(res.session.id);
+  };
+  $("#classStudentForm").onsubmit = async (ev) => {
+    ev.preventDefault();
+    const body = Object.fromEntries(new FormData(ev.target).entries());
+    body.weekly_minutes = 180;
+    if (!body.password) delete body.password;
+    await api(`/api/classes/${classId}/students`, { method: "POST", body: JSON.stringify(body) });
+    openClass(classId);
+  };
+  $("#importForm").onsubmit = async (ev) => {
+    ev.preventDefault();
+    const res = await apiUpload(`/api/classes/${classId}/import`, new FormData(ev.target));
+    $("#importResult").innerHTML = `<div class="notice">Importação concluída: ${res.created} criado(s), ${res.enrolled} matriculado(s), ${res.failures.length} falha(s).</div>`;
+    setTimeout(() => openClass(classId), 1200);
+  };
+  document.querySelectorAll(".open-session-btn").forEach(btn => btn.onclick = () => openSession(Number(btn.dataset.id)));
+}
+window.openClass = openClass;
+window.classesView = classesView;
+
+function classRosterTable(students, classId) {
+  if (!students.length) return "<p class='muted'>Nenhum aluno matriculado.</p>";
+  return `<div class="table-wrap"><table><thead><tr><th>Aluno</th><th>RA</th><th>E-mail</th><th>Certificado</th></tr></thead><tbody>
+    ${students.map(s => `<tr><td>${esc(s.name)}</td><td>${esc(s.registration || "-")}</td><td>${esc(s.email)}</td><td><button class="ghost" onclick="window.open('/api/certificates/classes/${classId}/students/${s.id}')">Gerar</button></td></tr>`).join("")}
+  </tbody></table></div>`;
+}
+
+async function openSession(sessionId) {
+  const data = await api(`/api/sessions/${sessionId}/attendance`);
+  setTitle(`Chamada - ${data.class.name}`);
+  $("#view").innerHTML = `
+    <section class="card">
+      <div class="row" style="justify-content:space-between">
+        <div><h2>${fmtDate(data.session.session_date)}</h2><p class="muted">${esc(data.class.program_name)} | ${esc(data.class.schedule || "")}</p></div>
+        <button class="secondary" onclick="openClass(${data.class.id})">Voltar para turma</button>
+      </div>
+      <form id="attendanceBulkForm" class="stack">
+        <div class="student-list">
+          ${data.attendance.map(a => attendanceRow(a, data.class.default_minutes)).join("")}
+        </div>
+        <button class="primary">Salvar chamada</button>
+      </form>
+    </section>`;
+  $("#attendanceBulkForm").onsubmit = async (ev) => {
+    ev.preventDefault();
+    const records = Array.from(document.querySelectorAll(".class-att-row")).map(row => ({
+      user_id: Number(row.dataset.userId),
+      status: row.querySelector("select[name='status']").value,
+      minutes: Number(row.querySelector("input[name='minutes']").value || 0),
+      notes: row.querySelector("input[name='notes']").value,
+    }));
+    await api(`/api/sessions/${sessionId}/attendance`, { method: "POST", body: JSON.stringify({ records }) });
+    alert("Chamada salva.");
+    openSession(sessionId);
+  };
+}
+window.openSession = openSession;
+
+function attendanceRow(a, defaultMinutes) {
+  return `<article class="student-row class-att-row" data-user-id="${a.user_id}">
+    <div><strong>${esc(a.name)}</strong><span class="muted">${esc(a.registration || "-")} | ${esc(a.email)}</span></div>
+    <select name="status">
+      <option value="present" ${a.status === "present" ? "selected" : ""}>Presente</option>
+      <option value="absent" ${a.status === "absent" ? "selected" : ""}>Falta</option>
+      <option value="justified" ${a.status === "justified" ? "selected" : ""}>Justificada</option>
+    </select>
+    <input name="minutes" type="number" min="0" max="600" value="${a.minutes || defaultMinutes}" title="Minutos">
+    <input name="notes" value="${esc(a.notes)}" placeholder="Observação">
+  </article>`;
 }
 
 async function loadStudents() {
