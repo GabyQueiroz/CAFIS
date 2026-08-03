@@ -75,6 +75,27 @@ def rowdict(row: sqlite3.Row | None) -> dict[str, Any] | None:
     return dict(row) if row else None
 
 
+def ensure_admin_user(db: sqlite3.Connection, name: str, email: str, password: str, notes: str) -> None:
+    admin_email = normalize_email(email)
+    if db.execute("SELECT id FROM users WHERE email = ?", (admin_email,)).fetchone():
+        return
+    db.execute(
+        """
+        INSERT INTO users
+        (name, email, password_hash, role, qr_secret, created_at, notes)
+        VALUES (?, ?, ?, 'admin', ?, ?, ?)
+        """,
+        (
+            name,
+            admin_email,
+            hash_password(password),
+            secrets.token_urlsafe(32),
+            now_iso(),
+            notes,
+        ),
+    )
+
+
 def init_db() -> None:
     with connect() as db:
         db.executescript(
@@ -290,24 +311,20 @@ def init_db() -> None:
                 db.execute(sql)
             except sqlite3.OperationalError:
                 pass
-        admin_email = normalize_email(os.getenv("CAFIS_ADMIN_EMAIL", "admin@cafis.utfpr.edu.br"))
-        if not db.execute("SELECT id FROM users WHERE email = ?", (admin_email,)).fetchone():
-            admin_password = os.getenv("CAFIS_ADMIN_PASSWORD", "Admin@12345")
-            db.execute(
-                """
-                INSERT INTO users
-                (name, email, password_hash, role, qr_secret, created_at, notes)
-                VALUES (?, ?, ?, 'admin', ?, ?, ?)
-                """,
-                (
-                    "Admin CAFIS",
-                    admin_email,
-                    hash_password(admin_password),
-                    secrets.token_urlsafe(32),
-                    now_iso(),
-                    "Troque a senha antes de publicar.",
-                ),
-            )
+        ensure_admin_user(
+            db,
+            "Admin CAFIS",
+            os.getenv("CAFIS_ADMIN_EMAIL", "admin@cafis.utfpr.edu.br"),
+            os.getenv("CAFIS_ADMIN_PASSWORD", "Admin@12345"),
+            "Troque a senha antes de publicar.",
+        )
+        ensure_admin_user(
+            db,
+            "Administrador CAFIS",
+            os.getenv("CAFIS_CAFIS_ADMIN_EMAIL", "adm.cafis@utfpr.edu.br"),
+            os.getenv("CAFIS_CAFIS_ADMIN_PASSWORD", "CAFIS@2026"),
+            "Administrador de bootstrap do CAFIS. Troque a senha no Render.",
+        )
         for name, category in [
             ("Esteira", "cardio"),
             ("Bicicleta ergometrica", "cardio"),

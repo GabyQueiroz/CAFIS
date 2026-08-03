@@ -21,3 +21,7 @@ services:
         sync: false
       - key: CAFIS_ADMIN_PASSWORD
         sync: false
+      - key: CAFIS_CAFIS_ADMIN_EMAIL
+        value: adm.cafis@utfpr.edu.br
+      - key: CAFIS_CAFIS_ADMIN_PASSWORD
+        sync: false
