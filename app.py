@@ -18,7 +18,7 @@ from typing import Any
 
 import qrcode
 from openpyxl import load_workbook
-from fastapi import Cookie, Depends, FastAPI, File, HTTPException, Response, UploadFile
+from fastapi import Cookie, Depends, FastAPI, File, Form, HTTPException, Response, UploadFile
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -1420,12 +1420,12 @@ def classes(
 @app.post("/api/programs/{program_id}/schedule-import")
 async def schedule_import(
     program_id: int,
-    activity_start: str,
-    activity_end: str = "",
-    teacher: str = "",
-    location: str = "",
-    period_label: str = "",
-    academic_year: int = datetime.now().year,
+    activity_start: str = Form(...),
+    activity_end: str = Form(""),
+    teacher: str = Form(""),
+    location: str = Form(""),
+    period_label: str = Form(""),
+    academic_year: int = Form(default=datetime.now().year),
     file: UploadFile = File(...),
     _: dict[str, Any] = Depends(require_admin),
 ) -> dict[str, Any]:

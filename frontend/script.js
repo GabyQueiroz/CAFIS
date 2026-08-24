@@ -240,14 +240,24 @@ async function classesView() {
   };
   $("#scheduleImportForm").onsubmit = async (ev) => {
     ev.preventDefault();
+    const resultBox = $("#scheduleImportResult");
+    const submitButton = ev.target.querySelector("button[type='submit'], button:not([type])");
     const formData = new FormData(ev.target);
     const programId = formData.get("program_id");
-    const result = await apiUpload(`/api/programs/${programId}/schedule-import`, formData);
-    $("#scheduleImportResult").innerHTML = `<div class="notice">Importação concluída: ${result.classes_created} turma(s), ${result.students_created} aluno(s) novo(s), ${result.enrollments_created} matrícula(s) e ${result.sessions_created} aula(s) gerada(s).</div>`;
-    state.classFilters.program_id = String(programId || "");
-    state.classFilters.period_label = String(formData.get("period_label") || "");
-    state.classFilters.academic_year = Number(formData.get("academic_year") || 2026);
-    setTimeout(() => classesView(), 900);
+    resultBox.innerHTML = `<div class="notice">Importando planilha...</div>`;
+    if (submitButton) submitButton.disabled = true;
+    try {
+      const result = await apiUpload(`/api/programs/${programId}/schedule-import`, formData);
+      resultBox.innerHTML = `<div class="notice">Importação concluída: ${result.classes_created} turma(s), ${result.students_created} aluno(s) novo(s), ${result.enrollments_created} matrícula(s) e ${result.sessions_created} aula(s) gerada(s).</div>`;
+      state.classFilters.program_id = String(programId || "");
+      state.classFilters.period_label = String(formData.get("period_label") || "");
+      state.classFilters.academic_year = Number(formData.get("academic_year") || 2026);
+      setTimeout(() => classesView(), 900);
+    } catch (err) {
+      resultBox.innerHTML = `<div class="notice error">Não foi possível importar: ${esc(err.message)}</div>`;
+    } finally {
+      if (submitButton) submitButton.disabled = false;
+    }
   };
   $("#classFilterForm").onsubmit = async (ev) => {
     ev.preventDefault();
