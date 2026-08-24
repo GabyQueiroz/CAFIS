@@ -1,4 +1,4 @@
-const state = { user: null, students: [], active: "", selectedStudent: null };
+const state = { user: null, students: [], active: "", selectedStudent: null, studentSearch: "", classFilters: { program_id: "", period_label: "", academic_year: new Date().getFullYear() } };
 const $ = (q) => document.querySelector(q);
 const api = async (url, options = {}) => {
   const res = await fetch(url, {
@@ -172,7 +172,11 @@ async function adminHome() {
 async function classesView() {
   setTitle("Turmas e projetos");
   const programs = await api("/api/programs");
-  const classes = await api("/api/classes");
+  const query = new URLSearchParams();
+  if (state.classFilters.program_id) query.set("program_id", state.classFilters.program_id);
+  if (state.classFilters.period_label) query.set("period_label", state.classFilters.period_label);
+  if (state.classFilters.academic_year) query.set("academic_year", state.classFilters.academic_year);
+  const classes = await api(`/api/classes${query.toString() ? `?${query.toString()}` : ""}`);
   $("#view").innerHTML = `
     <section class="grid two">
       <div class="card">
@@ -189,17 +193,39 @@ async function classesView() {
         </form>
       </div>
       <div class="card">
-        <h2>Projetos</h2>
-        <div class="grid">${programs.map(p => `<div class="notice"><strong>${esc(p.name)}</strong><br>${esc(p.description || "")}<br><span class="muted">${p.class_count} turma(s)</span></div>`).join("")}</div>
+        <h2>Importar planilha anual</h2>
+        <p class="muted">Escolha Academia ou Natação, envie a planilha com as abas de segunda a sexta e o sistema cria automaticamente as turmas, os alunos e o calendário do ano letivo.</p>
+        <form id="scheduleImportForm" class="stack">
+          <label>Projeto<select name="program_id">${programs.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join("")}</select></label>
+          <label>Início das atividades<input name="activity_start" type="date" value="2026-01-01" required></label>
+          <label>Fim das atividades<input name="activity_end" type="date" value="2026-12-31"></label>
+          <label>Período letivo<input name="period_label" placeholder="Ex.: 2026/1 ou 2026 anual" value="${esc(state.classFilters.period_label || "2026 anual")}"></label>
+          <label>Ano letivo<input name="academic_year" type="number" value="${esc(state.classFilters.academic_year || 2026)}" min="2020" max="2100"></label>
+          <label>Professor(a) responsável<input name="teacher" placeholder="Opcional"></label>
+          <label>Local<input name="location" placeholder="Piscina, academia..."></label>
+          <input name="file" type="file" accept=".xlsx" required>
+          <button class="primary">Importar planilha</button>
+        </form>
+        <div id="scheduleImportResult"></div>
       </div>
+    </section>
+    <section class="card" style="margin-top:16px">
+      <h2>Filtros e relatórios</h2>
+      <form id="classFilterForm" class="row" style="flex-wrap:wrap">
+        <select name="program_id"><option value="">Todos os projetos</option>${programs.map(p => `<option value="${p.id}" ${String(state.classFilters.program_id) === String(p.id) ? "selected" : ""}>${esc(p.name)}</option>`).join("")}</select>
+        <input name="period_label" placeholder="Período letivo" value="${esc(state.classFilters.period_label || "")}">
+        <input name="academic_year" type="number" placeholder="Ano" value="${esc(state.classFilters.academic_year || "")}">
+        <button class="secondary" type="submit">Aplicar</button>
+        <button class="ghost" id="downloadReportBtn" type="button">Ver relatório total</button>
+      </form>
     </section>
     <section class="card" style="margin-top:16px">
       <h2>Turmas cadastradas</h2>
       <div class="student-list">
         ${classes.length ? classes.map(c => `
           <article class="student-row">
-            <div><strong>${esc(c.name)}</strong><span class="muted">${esc(c.program_name)} | ${esc(c.schedule || "Sem horário")} | ${esc(c.teacher || "Sem professor(a)")}</span></div>
-            <span class="pill ok">${c.student_count} aluno(s)</span>
+            <div><strong>${esc(c.name)}</strong><span class="muted">${esc(c.program_name)} | ${esc(c.schedule || "Sem horário")} | ${esc(c.teacher || "Sem professor(a)")}${c.period_label ? ` | ${esc(c.period_label)}` : ""}</span></div>
+            <span class="pill ok">${c.student_count} aluno(s) | ${c.session_count || 0} aulas</span>
             <button class="secondary open-class-btn" data-id="${c.id}" type="button">Abrir</button>
           </article>`).join("") : "<p class='muted'>Nenhuma turma cadastrada.</p>"}
       </div>
@@ -212,6 +238,34 @@ async function classesView() {
     await api("/api/classes", { method: "POST", body: JSON.stringify(data) });
     classesView();
   };
+  $("#scheduleImportForm").onsubmit = async (ev) => {
+    ev.preventDefault();
+    const formData = new FormData(ev.target);
+    const programId = formData.get("program_id");
+    const result = await apiUpload(`/api/programs/${programId}/schedule-import`, formData);
+    $("#scheduleImportResult").innerHTML = `<div class="notice">Importação concluída: ${result.classes_created} turma(s), ${result.students_created} aluno(s) novo(s), ${result.enrollments_created} matrícula(s) e ${result.sessions_created} aula(s) gerada(s).</div>`;
+    state.classFilters.program_id = String(programId || "");
+    state.classFilters.period_label = String(formData.get("period_label") || "");
+    state.classFilters.academic_year = Number(formData.get("academic_year") || 2026);
+    setTimeout(() => classesView(), 900);
+  };
+  $("#classFilterForm").onsubmit = async (ev) => {
+    ev.preventDefault();
+    const data = Object.fromEntries(new FormData(ev.target).entries());
+    state.classFilters.program_id = data.program_id || "";
+    state.classFilters.period_label = data.period_label || "";
+    state.classFilters.academic_year = Number(data.academic_year || 0) || "";
+    classesView();
+  };
+  $("#downloadReportBtn").onclick = async () => {
+    const params = new URLSearchParams();
+    if (state.classFilters.program_id) params.set("program_id", state.classFilters.program_id);
+    if (state.classFilters.period_label) params.set("period_label", state.classFilters.period_label);
+    if (state.classFilters.academic_year) params.set("academic_year", state.classFilters.academic_year);
+    const report = await api(`/api/reports/classes${params.toString() ? `?${params.toString()}` : ""}`);
+    $("#modalBody").innerHTML = `<h2>Relatório total</h2>${fullReportTable(report.classes)}`;
+    $("#modal").showModal();
+  };
   document.querySelectorAll(".open-class-btn").forEach(btn => btn.onclick = () => openClass(Number(btn.dataset.id)));
 }
 
@@ -223,7 +277,7 @@ async function openClass(classId) {
       <div class="card">
         <h2>Turma</h2>
         <p><strong>${esc(data.class.program_name)}</strong></p>
-        <p class="muted">Horário: ${esc(data.class.schedule || "-")}<br>Professor(a): ${esc(data.class.teacher || "-")}<br>Minutos/aula: ${esc(data.class.default_minutes)}</p>
+        <p class="muted">Horário: ${esc(data.class.schedule || "-")}<br>Professor(a): ${esc(data.class.teacher || "-")}<br>Minutos/aula: ${esc(data.class.default_minutes)}<br>Período: ${esc(data.class.period_label || "-")}<br>Vigência: ${esc(data.class.activity_start || "-")} até ${esc(data.class.activity_end || "-")}</p>
         <div class="row"><button class="secondary" onclick="classesView()">Voltar</button></div>
       </div>
       <div class="card">
@@ -249,13 +303,31 @@ async function openClass(classId) {
         </form>
       </div>
       <div class="card">
-        <h2>Importar planilha</h2>
+        <h2>Presenças retroativas</h2>
+        <p class="muted">Lance presença, falta ou justificativa para um aluno em todas as aulas já geradas dentro de um período.</p>
+        <form id="historyForm" class="stack">
+          <label>Aluno<select name="user_id">${data.students.map(s => `<option value="${s.id}">${esc(s.name)}</option>`).join("")}</select></label>
+          <label>Data inicial<input name="start_date" type="date" value="${esc(data.class.activity_start || "2026-01-01")}" required></label>
+          <label>Data final<input name="end_date" type="date" value="${esc(data.class.activity_end || "2026-12-31")}"></label>
+          <label>Status<select name="status"><option value="present">Presente</option><option value="absent">Falta</option><option value="justified">Justificada</option></select></label>
+          <label>Observação<input name="notes" placeholder="Ex.: lançamento retroativo"></label>
+          <button class="primary">Aplicar no período</button>
+        </form>
+      </div>
+    </section>
+    <section class="grid two" style="margin-top:16px">
+      <div class="card">
+        <h2>Importar planilha simples</h2>
         <p class="muted">Aceita CSV ou XLSX com colunas: nome, email, cpf, matricula, telefone, nascimento, senha.</p>
         <form id="importForm" class="stack">
           <input name="file" type="file" accept=".csv,.xlsx" required>
           <button class="primary">Importar alunos</button>
         </form>
         <div id="importResult"></div>
+      </div>
+      <div class="card">
+        <h2>Resumo da turma</h2>
+        ${classSummaryTable(data.report)}
       </div>
     </section>
     <section class="card" style="margin-top:16px">
@@ -293,6 +365,13 @@ async function openClass(classId) {
     $("#importResult").innerHTML = `<div class="notice">Importação concluída: ${res.created} criado(s), ${res.enrolled} matriculado(s), ${res.failures.length} falha(s).</div>`;
     setTimeout(() => openClass(classId), 1200);
   };
+  $("#historyForm").onsubmit = async (ev) => {
+    ev.preventDefault();
+    const body = Object.fromEntries(new FormData(ev.target).entries());
+    const res = await api(`/api/classes/${classId}/attendance-history`, { method: "POST", body: JSON.stringify(body) });
+    alert(`Lançamento aplicado em ${res.updated_sessions} aula(s).`);
+    openClass(classId);
+  };
   document.querySelectorAll(".open-session-btn").forEach(btn => btn.onclick = () => openSession(Number(btn.dataset.id)));
 }
 window.openClass = openClass;
@@ -300,9 +379,27 @@ window.classesView = classesView;
 
 function classRosterTable(students, classId) {
   if (!students.length) return "<p class='muted'>Nenhum aluno matriculado.</p>";
-  return `<div class="table-wrap"><table><thead><tr><th>Aluno</th><th>RA</th><th>E-mail</th><th>Certificado</th></tr></thead><tbody>
-    ${students.map(s => `<tr><td>${esc(s.name)}</td><td>${esc(s.registration || "-")}</td><td>${esc(s.email)}</td><td><button class="ghost" onclick="window.open('/api/certificates/classes/${classId}/students/${s.id}')">Gerar</button></td></tr>`).join("")}
+  return `<div class="table-wrap"><table><thead><tr><th>Aluno</th><th>RA</th><th>E-mail</th><th>Perfil</th><th>Certificado</th></tr></thead><tbody>
+    ${students.map(s => `<tr><td>${esc(s.name)}</td><td>${esc(s.registration || "-")}</td><td>${esc(s.email)}</td><td><button class="secondary" onclick="openStudent(${s.id})">Abrir</button></td><td><button class="ghost" onclick="window.open('/api/certificates/classes/${classId}/students/${s.id}')">Gerar</button></td></tr>`).join("")}
   </tbody></table></div>`;
+}
+
+function classSummaryTable(rows) {
+  if (!rows?.length) return "<p class='muted'>Ainda não há resumo de presença.</p>";
+  return `<div class="table-wrap"><table><thead><tr><th>Aluno</th><th>Presenças</th><th>Faltas</th><th>Just.</th><th>Horas</th></tr></thead><tbody>
+    ${rows.map(row => `<tr><td>${esc(row.name)}</td><td>${row.presents || 0}</td><td>${row.absences || 0}</td><td>${row.justified || 0}</td><td>${(((row.minutes || 0) / 60)).toFixed(1)}</td></tr>`).join("")}
+  </tbody></table></div>`;
+}
+
+function fullReportTable(classes) {
+  if (!classes?.length) return "<p class='muted'>Nenhuma turma encontrada para esse filtro.</p>";
+  return classes.map(item => `
+    <section class="card" style="margin-top:12px">
+      <h3>${esc(item.class.name)}</h3>
+      <p class="muted">${esc(item.class.program_name)} | ${esc(item.class.period_label || "-")} | ${item.student_count} aluno(s) | ${(item.minutes_total / 60).toFixed(1)} hora(s)</p>
+      ${classSummaryTable(item.summary)}
+    </section>
+  `).join("");
 }
 
 async function openSession(sessionId) {
@@ -350,19 +447,24 @@ function attendanceRow(a, defaultMinutes) {
 }
 
 async function loadStudents() {
-  state.students = await api("/api/students");
+  const suffix = state.studentSearch ? `?search=${encodeURIComponent(state.studentSearch)}` : "";
+  state.students = await api(`/api/students${suffix}`);
 }
 
 async function students() {
   setTitle("Alunos");
   await loadStudents();
   $("#view").innerHTML = `
-    <div class="row" style="margin-bottom:14px"><button id="newStudentBtn" class="primary" type="button">Novo aluno</button></div>
+    <div class="row" style="margin-bottom:14px"><button id="newStudentBtn" class="primary" type="button">Novo aluno</button><input id="studentSearch" placeholder="Pesquisar aluno por nome, e-mail ou RA" value="${esc(state.studentSearch)}"></div>
     <section class="card table-wrap">
-      <table><thead><tr><th>Nome</th><th>Objetivo</th><th>Horas</th><th>Última avaliação</th><th>Ações</th></tr></thead>
-      <tbody>${state.students.map(s => `<tr><td><strong>${esc(s.name)}</strong><br><span class="muted">${esc(s.email)}</span></td><td>${esc(goalLabel(s.goal))}</td><td>${esc(s.total_hours)}</td><td>${fmtDate(s.last_evaluation)}</td><td class="row"><button class="secondary profile-btn" data-id="${s.id}" type="button">Perfil</button><button class="ghost eval-btn" data-id="${s.id}" type="button">Avaliar</button><button class="ghost cert-btn" data-id="${s.id}" type="button">Certificado</button></td></tr>`).join("")}</tbody></table>
+      <table><thead><tr><th>Nome</th><th>Objetivo</th><th>Horas</th><th>Faltas</th><th>Última avaliação</th><th>Ações</th></tr></thead>
+      <tbody>${state.students.map(s => `<tr><td><strong>${esc(s.name)}</strong><br><span class="muted">${esc(s.email)}</span></td><td>${esc(goalLabel(s.goal))}</td><td>${esc(s.total_hours)}</td><td>${esc(s.total_absences || 0)}</td><td>${fmtDate(s.last_evaluation)}</td><td class="row"><button class="secondary profile-btn" data-id="${s.id}" type="button">Perfil</button><button class="ghost eval-btn" data-id="${s.id}" type="button">Avaliar</button><button class="ghost cert-btn" data-id="${s.id}" type="button">Certificado</button></td></tr>`).join("")}</tbody></table>
     </section>`;
   $("#newStudentBtn").onclick = () => studentModal();
+  $("#studentSearch").oninput = async (ev) => {
+    state.studentSearch = ev.target.value;
+    students();
+  };
   document.querySelectorAll(".profile-btn").forEach(btn => btn.onclick = () => openStudent(Number(btn.dataset.id)));
   document.querySelectorAll(".eval-btn").forEach(btn => btn.onclick = () => evalModal(Number(btn.dataset.id)));
   document.querySelectorAll(".cert-btn").forEach(btn => btn.onclick = () => window.open(`/api/certificates/${btn.dataset.id}`));
@@ -436,7 +538,10 @@ async function openStudent(id) {
       <div class="card"><h2>Evolução</h2>${chart(d.evaluations, "qualia_score", "Score")}</div>
       <div class="card"><h2>Plano do estagiário</h2><form id="planForm" class="stack"><textarea name="plan_text" placeholder="Treino mensal, séries, exercícios, observações..."></textarea><div class="row"><input name="month" type="month" value="${new Date().toISOString().slice(0,7)}"><input name="week" type="number" min="1" max="5" value="1"><button class="primary">Salvar plano</button></div></form></div>
     </section>
-    <section class="card table-wrap" style="margin-top:16px"><h2>Presenças recentes</h2>${attendanceTable(d.attendance)}</section>`;
+    <section class="grid two" style="margin-top:16px">
+      <div class="card table-wrap"><h2>Presenças recentes</h2>${attendanceTable(d.attendance)}</div>
+      <div class="card table-wrap"><h2>Turmas e faltas</h2>${studentClassSummaryTable(d.class_summary)}</div>
+    </section>`;
   $("#planForm").onsubmit = async (ev) => {
     ev.preventDefault();
     const data = Object.fromEntries(new FormData(ev.target).entries());
@@ -446,6 +551,13 @@ async function openStudent(id) {
   };
 }
 window.openStudent = openStudent;
+
+function studentClassSummaryTable(rows) {
+  if (!rows?.length) return "<p class='muted'>Aluno sem turmas vinculadas.</p>";
+  return `<table><thead><tr><th>Turma</th><th>Período</th><th>Pres.</th><th>Faltas</th><th>Horas</th></tr></thead><tbody>
+    ${rows.map(row => `<tr><td>${esc(row.class_name)}<br><span class="muted">${esc(row.program_name)}</span></td><td>${esc(row.period_label || row.academic_year || "-")}</td><td>${row.presents || 0}</td><td>${row.absences || 0}</td><td>${(((row.minutes || 0) / 60)).toFixed(1)}</td></tr>`).join("")}
+  </tbody></table>`;
+}
 
 function editSelectedStudent() {
   if (state.selectedStudent?.student) studentModal(state.selectedStudent.student);

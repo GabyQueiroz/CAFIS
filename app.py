@@ -9,12 +9,15 @@ import os
 import secrets
 import smtplib
 import sqlite3
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from email.message import EmailMessage
 from pathlib import Path
+import re
+import unicodedata
 from typing import Any
 
 import qrcode
+from openpyxl import load_workbook
 from fastapi import Cookie, Depends, FastAPI, File, HTTPException, Response, UploadFile
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
@@ -28,6 +31,8 @@ COOKIE_NAME = "cafis_session"
 SESSION_SECONDS = 60 * 60 * 10
 PBKDF2_ITERS = 260_000
 COOKIE_SECURE = os.getenv("CAFIS_COOKIE_SECURE", "0").lower() in {"1", "true", "yes"}
+WEEKDAY_INDEX = {"segunda": 0, "terca": 1, "terça": 1, "quarta": 2, "quinta": 3, "sexta": 4, "sabado": 5, "sábado": 5}
+IMPORT_SHEETS = ("Segunda", "Terça", "Quarta", "Quinta", "Sexta")
 
 app = FastAPI(title="CAFIS Academia UTFPR PG", version="1.0.0")
 
@@ -73,6 +78,67 @@ def normalize_email(email: str) -> str:
 
 def rowdict(row: sqlite3.Row | None) -> dict[str, Any] | None:
     return dict(row) if row else None
+
+
+def normalize_text(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    return "".join(ch for ch in unicodedata.normalize("NFKD", text) if not unicodedata.combining(ch)).lower()
+
+
+def clean_label(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip())
+
+
+def only_digits(value: Any) -> str:
+    return "".join(ch for ch in str(value or "") if ch.isdigit())
+
+
+def as_iso_date(value: Any) -> str:
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    text = clean_label(value)
+    if not text:
+        return ""
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y"):
+        try:
+            return datetime.strptime(text, fmt).date().isoformat()
+        except ValueError:
+            continue
+    return text
+
+
+def parse_time_range(text: str) -> tuple[str, str]:
+    matches = re.findall(r"(\d{1,2}[:h]\d{2})", text.lower())
+    if len(matches) >= 2:
+        start, end = matches[0], matches[1]
+        return start.replace("h", ":"), end.replace("h", ":")
+    compact = re.findall(r"(\d{1,2}:\d{2})", text)
+    if len(compact) >= 2:
+        return compact[0], compact[1]
+    return "", ""
+
+
+def canonical_weekday_label(value: str) -> str:
+    normalized = normalize_text(value)
+    return {
+        "segunda": "Segunda",
+        "terca": "Terça",
+        "quarta": "Quarta",
+        "quinta": "Quinta",
+        "sexta": "Sexta",
+        "sabado": "Sábado",
+    }.get(normalized, clean_label(value))
+
+
+def daterange(start_date: date, end_date: date):
+    cursor = start_date
+    while cursor <= end_date:
+        yield cursor
+        cursor += timedelta(days=1)
 
 
 def ensure_admin_user(
@@ -221,6 +287,15 @@ def init_db() -> None:
                 teacher TEXT DEFAULT '',
                 default_minutes INTEGER NOT NULL DEFAULT 60,
                 location TEXT DEFAULT '',
+                weekday TEXT DEFAULT '',
+                start_time TEXT DEFAULT '',
+                end_time TEXT DEFAULT '',
+                activity_start TEXT DEFAULT '',
+                activity_end TEXT DEFAULT '',
+                academic_year INTEGER DEFAULT 0,
+                period_label TEXT DEFAULT '',
+                source_file TEXT DEFAULT '',
+                event_code TEXT DEFAULT '',
                 notes TEXT DEFAULT '',
                 active INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL
@@ -319,6 +394,15 @@ def init_db() -> None:
         for sql in [
             "ALTER TABLE equipment ADD COLUMN quantity INTEGER NOT NULL DEFAULT 1",
             "ALTER TABLE equipment ADD COLUMN photo_data_url TEXT DEFAULT ''",
+            "ALTER TABLE class_groups ADD COLUMN weekday TEXT DEFAULT ''",
+            "ALTER TABLE class_groups ADD COLUMN start_time TEXT DEFAULT ''",
+            "ALTER TABLE class_groups ADD COLUMN end_time TEXT DEFAULT ''",
+            "ALTER TABLE class_groups ADD COLUMN activity_start TEXT DEFAULT ''",
+            "ALTER TABLE class_groups ADD COLUMN activity_end TEXT DEFAULT ''",
+            "ALTER TABLE class_groups ADD COLUMN academic_year INTEGER DEFAULT 0",
+            "ALTER TABLE class_groups ADD COLUMN period_label TEXT DEFAULT ''",
+            "ALTER TABLE class_groups ADD COLUMN source_file TEXT DEFAULT ''",
+            "ALTER TABLE class_groups ADD COLUMN event_code TEXT DEFAULT ''",
         ]:
             try:
                 db.execute(sql)
@@ -459,6 +543,17 @@ class ClassIn(BaseModel):
     notes: str = ""
 
 
+class ScheduleImportOptions(BaseModel):
+    program_id: int
+    activity_start: str = Field(min_length=8, max_length=20)
+    activity_end: str = ""
+    teacher: str = ""
+    location: str = ""
+    period_label: str = ""
+    academic_year: int = Field(default=datetime.now().year, ge=2020, le=2100)
+    include_only_confirmed: bool = True
+
+
 class ClassStudentIn(StudentIn):
     user_id: int | None = None
 
@@ -477,6 +572,20 @@ class AttendanceItemIn(BaseModel):
 
 class AttendanceBulkIn(BaseModel):
     records: list[AttendanceItemIn]
+
+
+class AttendanceHistoryIn(BaseModel):
+    user_id: int
+    start_date: str = Field(min_length=8, max_length=20)
+    end_date: str = ""
+    status: str = Field(pattern="^(present|absent|justified)$")
+    notes: str = ""
+
+
+class AcademicReportQuery(BaseModel):
+    program_id: int | None = None
+    period_label: str = ""
+    academic_year: int | None = None
 
 
 def current_user(session: str | None = Cookie(default=None, alias=COOKIE_NAME)) -> dict[str, Any]:
@@ -652,21 +761,30 @@ def overview(_: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
 
 
 @app.get("/api/students")
-def list_students(_: dict[str, Any] = Depends(require_admin)) -> list[dict[str, Any]]:
+def list_students(search: str = "", _: dict[str, Any] = Depends(require_admin)) -> list[dict[str, Any]]:
     with connect() as db:
+        term = f"%{search.strip()}%" if search.strip() else "%"
         rows = db.execute(
             """
             SELECT u.*, (SELECT max(created_at) FROM evaluations e WHERE e.user_id=u.id) last_evaluation,
                    (SELECT coalesce(sum(minutes),0) FROM attendance a WHERE a.user_id=u.id) total_minutes,
-                   EXISTS(SELECT 1 FROM attendance a2 WHERE a2.user_id=u.id AND a2.check_out IS NULL) inside_now
-            FROM users u WHERE u.role='student' AND u.active=1 ORDER BY u.name
-            """
+                   EXISTS(SELECT 1 FROM attendance a2 WHERE a2.user_id=u.id AND a2.check_out IS NULL) inside_now,
+                   (SELECT count(*) FROM class_attendance ca WHERE ca.user_id=u.id AND ca.status='absent') total_absences,
+                   (SELECT count(*) FROM class_attendance ca WHERE ca.user_id=u.id AND ca.status='present') total_class_presences
+            FROM users u
+            WHERE u.role='student' AND u.active=1
+              AND (u.name LIKE ? OR u.email LIKE ? OR coalesce(u.registration,'') LIKE ?)
+            ORDER BY u.name
+            """,
+            (term, term, term),
         ).fetchall()
     return [
         public_user(dict(r)) | {
             "last_evaluation": r["last_evaluation"],
             "total_hours": round(r["total_minutes"] / 60, 1),
             "inside_now": bool(r["inside_now"]),
+            "total_absences": r["total_absences"] or 0,
+            "total_class_presences": r["total_class_presences"] or 0,
         }
         for r in rows
     ]
@@ -761,7 +879,25 @@ def student_detail(student_id: int, admin: dict[str, Any] = Depends(current_user
         evals = [dict(r) for r in db.execute("SELECT * FROM evaluations WHERE user_id=? ORDER BY created_at", (student_id,)).fetchall()]
         attendance = [dict(r) for r in db.execute("SELECT * FROM attendance WHERE user_id=? ORDER BY check_in DESC LIMIT 90", (student_id,)).fetchall()]
         plans = [dict(r) for r in db.execute("SELECT * FROM workout_plans WHERE user_id=? ORDER BY created_at DESC LIMIT 8", (student_id,)).fetchall()]
-    return {"student": public_user(student), "evaluations": evals, "attendance": attendance, "plans": plans}
+        class_summary = [dict(r) for r in db.execute(
+            """
+            SELECT c.id class_id, c.name class_name, p.name program_name, c.period_label, c.academic_year,
+                   SUM(CASE WHEN a.status='present' THEN 1 ELSE 0 END) presents,
+                   SUM(CASE WHEN a.status='absent' THEN 1 ELSE 0 END) absences,
+                   SUM(CASE WHEN a.status='justified' THEN 1 ELSE 0 END) justified,
+                   SUM(CASE WHEN a.status='present' THEN a.minutes ELSE 0 END) minutes
+            FROM enrollments e
+            JOIN class_groups c ON c.id=e.class_id
+            JOIN programs p ON p.id=c.program_id
+            LEFT JOIN class_sessions s ON s.class_id=c.id
+            LEFT JOIN class_attendance a ON a.session_id=s.id AND a.user_id=e.user_id
+            WHERE e.user_id=?
+            GROUP BY c.id, c.name, p.name, c.period_label, c.academic_year
+            ORDER BY p.name, c.weekday, c.start_time, c.name
+            """,
+            (student_id,),
+        ).fetchall()]
+    return {"student": public_user(student), "evaluations": evals, "attendance": attendance, "plans": plans, "class_summary": class_summary}
 
 
 @app.get("/api/my/dashboard")
@@ -997,6 +1133,245 @@ def upsert_student_from_payload(db: sqlite3.Connection, data: dict[str, Any]) ->
     return int(cur.lastrowid), password
 
 
+def build_class_name(program_name: str, weekday: str, start_time: str, end_time: str) -> str:
+    return f"{program_name} - {weekday} {start_time}-{end_time}".strip()
+
+
+def generate_class_sessions(db: sqlite3.Connection, class_id: int, start_date_text: str, end_date_text: str, weekday_text: str) -> int:
+    if not start_date_text or not end_date_text or not weekday_text:
+        return 0
+    start_date = date.fromisoformat(start_date_text)
+    end_date = date.fromisoformat(end_date_text)
+    weekday_key = normalize_text(weekday_text)
+    weekday_index = WEEKDAY_INDEX.get(weekday_key)
+    if weekday_index is None:
+        return 0
+    created = 0
+    for current in daterange(start_date, end_date):
+        if current.weekday() != weekday_index:
+            continue
+        before = db.total_changes
+        db.execute(
+            "INSERT OR IGNORE INTO class_sessions (class_id,session_date,notes,created_at) VALUES (?,?,?,?)",
+            (class_id, current.isoformat(), "", now_iso()),
+        )
+        if db.total_changes > before:
+            session_id = db.execute(
+                "SELECT id FROM class_sessions WHERE class_id=? AND session_date=?",
+                (class_id, current.isoformat()),
+            ).fetchone()["id"]
+            students = db.execute("SELECT user_id FROM enrollments WHERE class_id=?", (class_id,)).fetchall()
+            for student in students:
+                db.execute(
+                    """
+                    INSERT OR IGNORE INTO class_attendance
+                    (session_id,user_id,status,minutes,registered_at)
+                    VALUES (?,?,?,?,?)
+                    """,
+                    (session_id, student["user_id"], "absent", 0, now_iso()),
+                )
+            created += 1
+    return created
+
+
+def parse_workbook_groups(file_bytes: bytes) -> list[dict[str, Any]]:
+    workbook = load_workbook(io.BytesIO(file_bytes), data_only=True)
+    groups: list[dict[str, Any]] = []
+    valid_sheets = {normalize_text(item) for item in IMPORT_SHEETS}
+    for sheet_name in workbook.sheetnames:
+        normalized_sheet = normalize_text(sheet_name)
+        if normalized_sheet not in valid_sheets:
+            continue
+        weekday_label = canonical_weekday_label(sheet_name)
+        ws = workbook[sheet_name]
+        current_group: dict[str, Any] | None = None
+        for row in ws.iter_rows(values_only=True):
+            first = clean_label(row[0] if row else "")
+            normalized_first = normalize_text(first)
+            if first and ":" in first and "feira" in normalized_first:
+                start_time, end_time = parse_time_range(first)
+                current_group = {
+                    "weekday": weekday_label,
+                    "title": first,
+                    "start_time": start_time,
+                    "end_time": end_time,
+                    "columns": {},
+                    "students": [],
+                }
+                groups.append(current_group)
+                continue
+            if not current_group:
+                continue
+            if normalized_first.startswith("cod. evento"):
+                columns = {}
+                for index, header in enumerate(row):
+                    normalized_header = normalize_text(header)
+                    if normalized_header:
+                        columns[normalized_header] = index
+                current_group["columns"] = columns
+                continue
+            if normalized_first.startswith("confirmado(s)"):
+                current_group = None
+                continue
+            columns = current_group.get("columns", {})
+            def col(*names: str):
+                for name in names:
+                    idx = columns.get(normalize_text(name))
+                    if idx is not None and idx < len(row):
+                        return row[idx]
+                return None
+            code = col("Cod. Evento") if columns else (row[0] if len(row) > 0 else None)
+            registration = col("Nº Inscrição", "N� Inscri��o") if columns else (row[1] if len(row) > 1 else None)
+            name = clean_label(col("Nome da Pessoa") if columns else (row[2] if len(row) > 2 else ""))
+            birth_value = col("Data de Nascimento") if columns else (row[3] if len(row) > 3 else None)
+            sex = clean_label(col("Sexo") if columns else (row[4] if len(row) > 4 else ""))
+            phone_home = clean_label(col("Tel. Residencial") if columns else (row[5] if len(row) > 5 else ""))
+            phone_mobile = clean_label(col("Tel. Celular") if columns else (row[6] if len(row) > 6 else ""))
+            email = clean_label(col("E-mail") if columns else (row[7] if len(row) > 7 else ""))
+            status = clean_label(col("Situação", "Situa��o") if columns else (row[8] if len(row) > 8 else ""))
+            if not name:
+                continue
+            normalized_status = normalize_text(status)
+            if normalized_status and any(flag in normalized_status for flag in ("cancelado", "desistente")):
+                continue
+            current_group["students"].append(
+                {
+                    "event_code": only_digits(code),
+                    "registration": only_digits(registration) or clean_label(registration),
+                    "name": name,
+                    "birth_date": as_iso_date(birth_value),
+                    "sex": sex,
+                    "phone": phone_mobile or phone_home,
+                    "email": email,
+                    "status": status or "Confirmado",
+                }
+            )
+    return [group for group in groups if group["students"]]
+
+
+def import_schedule_workbook(
+    db: sqlite3.Connection,
+    *,
+    program_id: int,
+    file_name: str,
+    file_bytes: bytes,
+    activity_start: str,
+    activity_end: str,
+    teacher: str,
+    location: str,
+    period_label: str,
+    academic_year: int,
+) -> dict[str, Any]:
+    program = db.execute("SELECT * FROM programs WHERE id=?", (program_id,)).fetchone()
+    if not program:
+        raise HTTPException(404, "Projeto não encontrado.")
+    groups = parse_workbook_groups(file_bytes)
+    if not groups:
+        raise HTTPException(400, "Não encontrei turmas válidas nas abas Segunda a Sexta da planilha.")
+    created_classes = 0
+    created_students = 0
+    enrollments = 0
+    sessions_created = 0
+    imported_classes: list[dict[str, Any]] = []
+    program_name = program["name"]
+    effective_end = activity_end or f"{academic_year}-12-31"
+    for group in groups:
+        class_name = build_class_name(program_name, group["weekday"], group["start_time"], group["end_time"])
+        existing = db.execute(
+            """
+            SELECT id FROM class_groups
+            WHERE program_id=? AND name=? AND weekday=? AND start_time=? AND end_time=? AND academic_year=? AND active=1
+            """,
+            (program_id, class_name, group["weekday"], group["start_time"], group["end_time"], academic_year),
+        ).fetchone()
+        if existing:
+            class_id = existing["id"]
+        else:
+            cur = db.execute(
+                """
+                INSERT INTO class_groups
+                (program_id,name,schedule,teacher,default_minutes,location,weekday,start_time,end_time,activity_start,activity_end,academic_year,period_label,source_file,event_code,notes,created_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    program_id,
+                    class_name,
+                    f"{group['weekday']}, {group['start_time']} às {group['end_time']}",
+                    teacher,
+                    50,
+                    location,
+                    group["weekday"],
+                    group["start_time"],
+                    group["end_time"],
+                    activity_start,
+                    effective_end,
+                    academic_year,
+                    period_label,
+                    file_name,
+                    group["students"][0].get("event_code", ""),
+                    group["title"],
+                    now_iso(),
+                ),
+            )
+            class_id = int(cur.lastrowid)
+            created_classes += 1
+        imported_classes.append({"class_id": class_id, "name": class_name, "weekday": group["weekday"], "students": len(group["students"])})
+        for student in group["students"]:
+            fallback_email = ""
+            if not student["email"]:
+                reg = student["registration"] or only_digits(student["birth_date"]) or secrets.token_hex(4)
+                fallback_email = f"aluno{reg}@cafis.local"
+            payload = {
+                "name": student["name"],
+                "email": student["email"] or fallback_email,
+                "registration": student["registration"],
+                "birth_date": student["birth_date"],
+                "phone": student["phone"],
+                "notes": f"Importado de {file_name} | Status: {student['status']}",
+                "weekly_minutes": 50,
+                "availability_days": group["weekday"],
+            }
+            user_id, initial_password = upsert_student_from_payload(db, payload)
+            if initial_password:
+                created_students += 1
+            before = db.total_changes
+            db.execute(
+                "INSERT OR IGNORE INTO enrollments (class_id,user_id,created_at) VALUES (?,?,?)",
+                (class_id, user_id, now_iso()),
+            )
+            if db.total_changes > before:
+                enrollments += 1
+        sessions_created += generate_class_sessions(db, class_id, activity_start, effective_end, group["weekday"])
+    return {
+        "classes_created": created_classes,
+        "students_created": created_students,
+        "enrollments_created": enrollments,
+        "sessions_created": sessions_created,
+        "classes": imported_classes,
+    }
+
+
+def class_report_summary(db: sqlite3.Connection, class_id: int) -> list[dict[str, Any]]:
+    rows = db.execute(
+        """
+        SELECT u.id user_id, u.name, u.email, u.registration,
+               SUM(CASE WHEN a.status='present' THEN 1 ELSE 0 END) presents,
+               SUM(CASE WHEN a.status='absent' THEN 1 ELSE 0 END) absences,
+               SUM(CASE WHEN a.status='justified' THEN 1 ELSE 0 END) justified,
+               SUM(CASE WHEN a.status='present' THEN a.minutes ELSE 0 END) minutes
+        FROM enrollments e
+        JOIN users u ON u.id = e.user_id
+        LEFT JOIN class_sessions s ON s.class_id = e.class_id
+        LEFT JOIN class_attendance a ON a.session_id = s.id AND a.user_id = u.id
+        WHERE e.class_id = ?
+        GROUP BY u.id, u.name, u.email, u.registration
+        ORDER BY u.name
+        """,
+        (class_id,),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
 @app.get("/api/programs")
 def programs(_: dict[str, Any] = Depends(require_admin)) -> list[dict[str, Any]]:
     with connect() as db:
@@ -1011,17 +1386,70 @@ def programs(_: dict[str, Any] = Depends(require_admin)) -> list[dict[str, Any]]
 
 
 @app.get("/api/classes")
-def classes(_: dict[str, Any] = Depends(require_admin)) -> list[dict[str, Any]]:
+def classes(
+    program_id: int | None = None,
+    period_label: str = "",
+    academic_year: int | None = None,
+    _: dict[str, Any] = Depends(require_admin),
+) -> list[dict[str, Any]]:
     with connect() as db:
+        where = ["c.active=1"]
+        params: list[Any] = []
+        if program_id:
+            where.append("c.program_id=?")
+            params.append(program_id)
+        if period_label.strip():
+            where.append("lower(c.period_label)=lower(?)")
+            params.append(period_label.strip())
+        if academic_year:
+            where.append("c.academic_year=?")
+            params.append(academic_year)
         rows = db.execute(
-            """
+            f"""
             SELECT c.*, p.name program_name,
-                   (SELECT count(*) FROM enrollments e WHERE e.class_id=c.id) student_count
+                   (SELECT count(*) FROM enrollments e WHERE e.class_id=c.id) student_count,
+                   (SELECT count(*) FROM class_sessions s WHERE s.class_id=c.id) session_count
             FROM class_groups c JOIN programs p ON p.id=c.program_id
-            WHERE c.active=1 ORDER BY p.name, c.name
-            """
+            WHERE {' AND '.join(where)} ORDER BY p.name, c.weekday, c.start_time, c.name
+            """,
+            tuple(params),
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+@app.post("/api/programs/{program_id}/schedule-import")
+async def schedule_import(
+    program_id: int,
+    activity_start: str,
+    activity_end: str = "",
+    teacher: str = "",
+    location: str = "",
+    period_label: str = "",
+    academic_year: int = datetime.now().year,
+    file: UploadFile = File(...),
+    _: dict[str, Any] = Depends(require_admin),
+) -> dict[str, Any]:
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(400, "Arquivo vazio.")
+    start_iso = as_iso_date(activity_start)
+    if not start_iso:
+        raise HTTPException(400, "Informe a data de início da atividade.")
+    end_iso = as_iso_date(activity_end) if activity_end else f"{academic_year}-12-31"
+    with connect() as db:
+        result = import_schedule_workbook(
+            db,
+            program_id=program_id,
+            file_name=file.filename or "planilha.xlsx",
+            file_bytes=raw,
+            activity_start=start_iso,
+            activity_end=end_iso,
+            teacher=teacher,
+            location=location,
+            period_label=period_label or f"{academic_year}",
+            academic_year=academic_year,
+        )
+    return result
 
 
 @app.post("/api/classes")
@@ -1071,11 +1499,12 @@ def class_roster(class_id: int, _: dict[str, Any] = Depends(require_admin)) -> d
         ]
         sessions = [
             dict(r) for r in db.execute(
-                "SELECT * FROM class_sessions WHERE class_id=? ORDER BY session_date DESC LIMIT 20",
+                "SELECT * FROM class_sessions WHERE class_id=? ORDER BY session_date DESC LIMIT 60",
                 (class_id,),
             ).fetchall()
         ]
-    return {"class": class_row, "students": students, "sessions": sessions}
+        report = class_report_summary(db, class_id)
+    return {"class": class_row, "students": students, "sessions": sessions, "report": report}
 
 
 @app.post("/api/classes/{class_id}/students")
@@ -1092,6 +1521,16 @@ def add_class_student(class_id: int, data: ClassStudentIn, _: dict[str, Any] = D
             "INSERT OR IGNORE INTO enrollments (class_id,user_id,created_at) VALUES (?,?,?)",
             (class_id, user_id, now_iso()),
         )
+        existing_sessions = db.execute("SELECT id FROM class_sessions WHERE class_id=?", (class_id,)).fetchall()
+        for session in existing_sessions:
+            db.execute(
+                """
+                INSERT OR IGNORE INTO class_attendance
+                (session_id,user_id,status,minutes,registered_at)
+                VALUES (?,?,?,?,?)
+                """,
+                (session["id"], user_id, "absent", 0, now_iso()),
+            )
         student = rowdict(db.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone())
     return {"student": public_user(student), "initial_password": initial_password}
 
@@ -1154,6 +1593,15 @@ async def import_class_students(
                 )
                 if db.total_changes > before:
                     enrolled += 1
+                for session in db.execute("SELECT id FROM class_sessions WHERE class_id=?", (class_id,)).fetchall():
+                    db.execute(
+                        """
+                        INSERT OR IGNORE INTO class_attendance
+                        (session_id,user_id,status,minutes,registered_at)
+                        VALUES (?,?,?,?,?)
+                        """,
+                        (session["id"], user_id, "absent", 0, now_iso()),
+                    )
             except Exception as exc:
                 failures.append({"row": idx, "error": str(exc)})
     return {"rows": len(rows), "created": created, "enrolled": enrolled, "failures": failures}
@@ -1210,6 +1658,110 @@ def get_session_attendance(session_id: int, _: dict[str, Any] = Depends(require_
             (session_id, session["class_id"]),
         ).fetchall()
     return {"class": class_row, "session": session, "attendance": [dict(r) for r in rows]}
+
+
+@app.get("/api/classes/{class_id}/report")
+def class_report(class_id: int, _: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
+    with connect() as db:
+        class_row = rowdict(get_class_or_404(db, class_id))
+        summary = class_report_summary(db, class_id)
+        totals = db.execute(
+            """
+            SELECT
+                COUNT(DISTINCT s.id) total_sessions,
+                SUM(CASE WHEN a.status='present' THEN a.minutes ELSE 0 END) total_minutes
+            FROM class_sessions s
+            LEFT JOIN class_attendance a ON a.session_id = s.id
+            WHERE s.class_id=?
+            """,
+            (class_id,),
+        ).fetchone()
+    return {"class": class_row, "summary": summary, "totals": dict(totals)}
+
+
+@app.post("/api/classes/{class_id}/attendance-history")
+def launch_attendance_history(
+    class_id: int,
+    data: AttendanceHistoryIn,
+    _: dict[str, Any] = Depends(require_admin),
+) -> dict[str, Any]:
+    with connect() as db:
+        class_row = get_class_or_404(db, class_id)
+        get_student_or_404(db, data.user_id)
+        start_iso = as_iso_date(data.start_date)
+        end_iso = as_iso_date(data.end_date) if data.end_date else date.today().isoformat()
+        rows = db.execute(
+            """
+            SELECT s.id session_id
+            FROM class_sessions s
+            WHERE s.class_id=? AND s.session_date BETWEEN ? AND ?
+            ORDER BY s.session_date
+            """,
+            (class_id, start_iso, end_iso),
+        ).fetchall()
+        updated = 0
+        for row in rows:
+            minutes = class_row["default_minutes"] if data.status == "present" else 0
+            db.execute(
+                """
+                INSERT INTO class_attendance
+                (session_id,user_id,status,minutes,notes,registered_at)
+                VALUES (?,?,?,?,?,?)
+                ON CONFLICT(session_id,user_id) DO UPDATE SET
+                status=excluded.status,
+                minutes=excluded.minutes,
+                notes=excluded.notes,
+                registered_at=excluded.registered_at
+                """,
+                (row["session_id"], data.user_id, data.status, minutes, data.notes, now_iso()),
+            )
+            updated += 1
+    return {"updated_sessions": updated, "status": data.status, "start_date": start_iso, "end_date": end_iso}
+
+
+@app.get("/api/reports/classes")
+def classes_report(
+    program_id: int | None = None,
+    period_label: str = "",
+    academic_year: int | None = None,
+    _: dict[str, Any] = Depends(require_admin),
+) -> dict[str, Any]:
+    with connect() as db:
+        where = ["c.active=1"]
+        params: list[Any] = []
+        if program_id:
+            where.append("c.program_id=?")
+            params.append(program_id)
+        if period_label.strip():
+            where.append("lower(c.period_label)=lower(?)")
+            params.append(period_label.strip())
+        if academic_year:
+            where.append("c.academic_year=?")
+            params.append(academic_year)
+        classes = db.execute(
+            f"""
+            SELECT c.*, p.name program_name
+            FROM class_groups c
+            JOIN programs p ON p.id=c.program_id
+            WHERE {' AND '.join(where)}
+            ORDER BY p.name, c.weekday, c.start_time, c.name
+            """,
+            tuple(params),
+        ).fetchall()
+        result = []
+        for class_row in classes:
+            summary = class_report_summary(db, class_row["id"])
+            result.append(
+                {
+                    "class": dict(class_row),
+                    "summary": summary,
+                    "student_count": len(summary),
+                    "present_total": sum(item.get("presents") or 0 for item in summary),
+                    "absence_total": sum(item.get("absences") or 0 for item in summary),
+                    "minutes_total": sum(item.get("minutes") or 0 for item in summary),
+                }
+            )
+    return {"classes": result}
 
 
 @app.post("/api/sessions/{session_id}/attendance")
