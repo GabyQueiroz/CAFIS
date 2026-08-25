@@ -128,8 +128,18 @@ async function render(view) {
     ]);
   }
   const routes = { admin: adminHome, classes: classesView, students, pending, attendance, equipment, messages, student: studentHome, myqr, myevolution, myeval };
-  await routes[view]();
+  const route = routes[view] || routes[state.user.role === "admin" ? "admin" : "student"];
+  $("#view").innerHTML = `<section class="card"><p class="muted">Carregando...</p></section>`;
+  try {
+    await route();
+  } catch (err) {
+    $("#view").innerHTML = `<section class="card"><h2>Não foi possível carregar esta tela</h2><p class="message">${esc(err.message || err)}</p></section>`;
+    if (err.message === "Sessao invalida ou expirada." || err.message === "Login necessario.") {
+      setTimeout(() => logout(), 1200);
+    }
+  }
 }
+window.render = render;
 
 async function adminHome() {
   setTitle("Painel dos projetos");
