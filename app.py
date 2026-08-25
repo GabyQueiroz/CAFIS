@@ -37,6 +37,8 @@ def resolve_db_path() -> Path:
 
 
 DB_PATH = resolve_db_path()
+ACTIVE_DB_PATH = DB_PATH
+DB_STORAGE_WARNING = ""
 FRONTEND_DIR = BASE_DIR / "frontend"
 UTC = timezone.utc
 COOKIE_NAME = "cafis_session"
@@ -54,16 +56,20 @@ def now_iso() -> str:
 
 
 def connect() -> sqlite3.Connection:
+    global ACTIVE_DB_PATH, DB_STORAGE_WARNING
     db_path = DB_PATH
     try:
         db_path.parent.mkdir(parents=True, exist_ok=True)
-    except PermissionError as exc:
-        fallback = os.getenv("CAFIS_FALLBACK_DB_PATH")
-        if os.getenv("CAFIS_DB_PATH") or str(DB_PATH).startswith("/var/data") or not fallback:
-            raise RuntimeError(f"Sem permissao para gravar o banco em {DB_PATH}") from exc
+    except OSError as exc:
+        fallback = os.getenv("CAFIS_FALLBACK_DB_PATH", "/tmp/cafis_academia.db")
         db_path = Path(fallback)
         db_path.parent.mkdir(parents=True, exist_ok=True)
-        print(f"WARNING: sem permissao para {DB_PATH}; usando banco temporario em {db_path}")
+        DB_STORAGE_WARNING = (
+            f"Sem permissao para gravar o banco em {DB_PATH}; "
+            f"usando banco temporario em {db_path}. Configure um Persistent Disk no Render."
+        )
+        print(f"WARNING: {DB_STORAGE_WARNING} Erro original: {exc}")
+    ACTIVE_DB_PATH = db_path
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
@@ -463,10 +469,12 @@ def startup() -> None:
 def health() -> dict[str, Any]:
     return {
         "status": "ok",
-        "database_path": str(DB_PATH),
-        "database_exists": DB_PATH.exists(),
-        "database_parent_exists": DB_PATH.parent.exists(),
-        "persistent_database": str(DB_PATH).startswith("/var/data"),
+        "configured_database_path": str(DB_PATH),
+        "database_path": str(ACTIVE_DB_PATH),
+        "database_exists": ACTIVE_DB_PATH.exists(),
+        "database_parent_exists": ACTIVE_DB_PATH.parent.exists(),
+        "persistent_database": str(ACTIVE_DB_PATH).startswith("/var/data"),
+        "storage_warning": DB_STORAGE_WARNING,
     }
 
 
