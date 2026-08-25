@@ -1,8 +1,9 @@
-const state = { user: null, students: [], active: "", selectedStudent: null, studentSearch: "", classFilters: { program_id: "", period_label: "", academic_year: new Date().getFullYear() } };
+const state = { user: null, students: [], active: "", renderSeq: 0, selectedStudent: null, studentSearch: "", classFilters: { program_id: "", period_label: "", academic_year: new Date().getFullYear() } };
 const $ = (q) => document.querySelector(q);
 const api = async (url, options = {}) => {
   const res = await fetch(url, {
     credentials: "include",
+    cache: "no-store",
     headers: { "Content-Type": "application/json", ...(options.headers || {}) },
     ...options,
   });
@@ -10,7 +11,7 @@ const api = async (url, options = {}) => {
   return res.json();
 };
 const apiUpload = async (url, formData) => {
-  const res = await fetch(url, { method: "POST", credentials: "include", body: formData });
+  const res = await fetch(url, { method: "POST", credentials: "include", cache: "no-store", body: formData });
   if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || "Erro no envio");
   return res.json();
 };
@@ -30,6 +31,8 @@ function nav(items) {
   $("#nav").innerHTML = items.map(i => `<button data-view="${i.id}" class="${state.active === i.id ? "active" : ""}">${i.label}</button>`).join("");
   $("#nav").querySelectorAll("button").forEach(btn => btn.onclick = () => render(btn.dataset.view));
 }
+
+const isCurrentRender = (seq) => !seq || seq === state.renderSeq;
 
 function showApp(user) {
   state.user = user;
@@ -108,6 +111,7 @@ window.logout = logout;
 $("#logoutBtn").onclick = logout;
 
 async function render(view) {
+  const seq = ++state.renderSeq;
   state.active = view;
   if (state.user.role === "admin") {
     nav([
@@ -131,8 +135,9 @@ async function render(view) {
   const route = routes[view] || routes[state.user.role === "admin" ? "admin" : "student"];
   $("#view").innerHTML = `<section class="card"><p class="muted">Carregando...</p></section>`;
   try {
-    await route();
+    await route(seq);
   } catch (err) {
+    if (!isCurrentRender(seq)) return;
     $("#view").innerHTML = `<section class="card"><h2>Não foi possível carregar esta tela</h2><p class="message">${esc(err.message || err)}</p></section>`;
     if (err.message === "Sessao invalida ou expirada." || err.message === "Login necessario.") {
       setTimeout(() => logout(), 1200);
@@ -141,12 +146,15 @@ async function render(view) {
 }
 window.render = render;
 
-async function adminHome() {
+async function adminHome(seq) {
   setTitle("Painel dos projetos");
-  const o = await api("/api/admin/overview");
-  const pendingRows = await api("/api/admin/pending-students");
-  const programs = await api("/api/programs");
-  const classes = await api("/api/classes");
+  const [o, pendingRows, programs, classes] = await Promise.all([
+    api("/api/admin/overview"),
+    api("/api/admin/pending-students"),
+    api("/api/programs"),
+    api("/api/classes"),
+  ]);
+  if (!isCurrentRender(seq)) return;
   $("#view").innerHTML = `
     <section class="grid three">
       <div class="card metric"><span class="muted">Alunos ativos</span><strong>${o.students}</strong></div>
@@ -179,14 +187,17 @@ async function adminHome() {
     </section>`;
 }
 
-async function classesView() {
+async function classesView(seq) {
   setTitle("Turmas e projetos");
-  const programs = await api("/api/programs");
   const query = new URLSearchParams();
   if (state.classFilters.program_id) query.set("program_id", state.classFilters.program_id);
   if (state.classFilters.period_label) query.set("period_label", state.classFilters.period_label);
   if (state.classFilters.academic_year) query.set("academic_year", state.classFilters.academic_year);
-  const classes = await api(`/api/classes${query.toString() ? `?${query.toString()}` : ""}`);
+  const [programs, classes] = await Promise.all([
+    api("/api/programs"),
+    api(`/api/classes${query.toString() ? `?${query.toString()}` : ""}`),
+  ]);
+  if (!isCurrentRender(seq)) return;
   $("#view").innerHTML = `
     <section class="grid two">
       <div class="card">
@@ -290,7 +301,10 @@ async function classesView() {
 }
 
 async function openClass(classId) {
+  const seq = ++state.renderSeq;
+  $("#view").innerHTML = `<section class="card"><p class="muted">Carregando turma...</p></section>`;
   const data = await api(`/api/classes/${classId}/roster`);
+  if (!isCurrentRender(seq)) return;
   setTitle(data.class.name);
   $("#view").innerHTML = `
     <section class="grid two">
@@ -392,8 +406,9 @@ async function openClass(classId) {
     setTimeout(() => openClass(classId), 1200);
   };
   document.querySelectorAll(".open-session-btn").forEach(btn => btn.onclick = () => openSession(Number(btn.dataset.id)));
-  loadAttendanceGrid(classId).catch(err => {
-    $("#attendanceGrid").innerHTML = `<p class="message">Não foi possível carregar a planilha de chamada: ${esc(err.message || err)}</p>`;
+  loadAttendanceGrid(classId, seq).catch(err => {
+    const gridEl = $("#attendanceGrid");
+    if (gridEl && isCurrentRender(seq)) gridEl.innerHTML = `<p class="message">Não foi possível carregar a planilha de chamada: ${esc(err.message || err)}</p>`;
   });
 }
 window.openClass = openClass;
@@ -424,14 +439,15 @@ function fullReportTable(classes) {
   `).join("");
 }
 
-async function loadAttendanceGrid(classId) {
+async function loadAttendanceGrid(classId, seq) {
   const grid = await api(`/api/classes/${classId}/attendance-grid`);
+  const gridEl = $("#attendanceGrid");
+  if (!gridEl || !isCurrentRender(seq)) return;
+  const saveBtn = $("#saveAttendanceGridBtn");
+  const msg = $("#attendanceGridMsg");
   const changes = new Map();
   const statusCycle = { absent: "present", present: "justified", justified: "absent" };
   const statusLabels = { absent: "F", present: "P", justified: "J" };
-  const gridEl = $("#attendanceGrid");
-  const saveBtn = $("#saveAttendanceGridBtn");
-  const msg = $("#attendanceGridMsg");
   if (!grid.sessions.length) {
     gridEl.innerHTML = "<p class='muted'>Nenhuma aula gerada para esta turma.</p>";
     return;
@@ -488,9 +504,10 @@ async function loadAttendanceGrid(classId) {
       method: "POST",
       body: JSON.stringify({ records: Array.from(changes.values()) }),
     });
+    if (!isCurrentRender(seq)) return;
     changes.clear();
     msg.innerHTML = `<div class="notice">Chamada salva: ${res.saved} célula(s) atualizada(s).</div>`;
-    setTimeout(() => openClass(classId), 800);
+    setTimeout(() => { if (isCurrentRender(seq)) openClass(classId); }, 800);
   };
 }
 
@@ -501,7 +518,10 @@ function shortDate(value) {
 }
 
 async function openSession(sessionId) {
+  const seq = ++state.renderSeq;
+  $("#view").innerHTML = `<section class="card"><p class="muted">Carregando chamada...</p></section>`;
   const data = await api(`/api/sessions/${sessionId}/attendance`);
+  if (!isCurrentRender(seq)) return;
   setTitle(`Chamada - ${data.class.name}`);
   $("#view").innerHTML = `
     <section class="card">
@@ -549,9 +569,10 @@ async function loadStudents() {
   state.students = await api(`/api/students${suffix}`);
 }
 
-async function students() {
+async function students(seq) {
   setTitle("Alunos");
   await loadStudents();
+  if (!isCurrentRender(seq)) return;
   $("#view").innerHTML = `
     <div class="row" style="margin-bottom:14px"><button id="newStudentBtn" class="primary" type="button">Novo aluno</button><input id="studentSearch" placeholder="Pesquisar aluno por nome, e-mail ou RA" value="${esc(state.studentSearch)}"></div>
     <section class="card table-wrap">
@@ -568,9 +589,10 @@ async function students() {
   document.querySelectorAll(".cert-btn").forEach(btn => btn.onclick = () => window.open(`/api/certificates/${btn.dataset.id}`));
 }
 
-async function pending() {
+async function pending(seq) {
   setTitle("Solicitações de cadastro");
   const rows = await api("/api/admin/pending-students");
+  if (!isCurrentRender(seq)) return;
   $("#view").innerHTML = `
     <section class="card table-wrap">
       ${rows.length ? `<table><thead><tr><th>Aluno</th><th>Objetivo</th><th>Disponibilidade</th><th>Solicitado em</th><th>Ações</th></tr></thead><tbody>${rows.map(s => `<tr><td><strong>${esc(s.name)}</strong><br><span class="muted">${esc(s.email)} | RA ${esc(s.registration)}</span></td><td>${esc(goalLabel(s.goal))}</td><td>${esc(s.availability_days)}<br><span class="muted">${esc(s.weekly_minutes)} min/semana</span></td><td>${fmtDate(s.created_at)}</td><td class="row"><button class="primary" onclick="approveStudent(${s.id})">Aprovar</button><button class="danger" onclick="rejectStudent(${s.id})">Recusar</button></td></tr>`).join("")}</tbody></table>` : "<p class='muted'>Nenhuma solicitação pendente.</p>"}
@@ -754,9 +776,10 @@ function wireEvaluationForm(selector, done) {
   };
 }
 
-async function attendance() {
+async function attendance(seq) {
   setTitle("Presença");
   await loadStudents();
+  if (!isCurrentRender(seq)) return;
   const inside = state.students.filter(s => s.inside_now).length;
   $("#view").innerHTML = `
     <section class="grid three">
@@ -881,9 +904,10 @@ async function toggleAttendance(userId) {
 }
 window.toggleAttendance = toggleAttendance;
 
-async function equipment() {
+async function equipment(seq) {
   setTitle("Equipamentos");
   const rows = await api("/api/equipment");
+  if (!isCurrentRender(seq)) return;
   $("#view").innerHTML = `
     <section class="grid two">
       <div class="equipment-grid">
@@ -988,9 +1012,10 @@ function equipmentModal(item) {
 }
 window.equipmentModal = equipmentModal;
 
-async function messages() {
+async function messages(seq) {
   setTitle("E-mails e recados");
   await loadStudents();
+  if (!isCurrentRender(seq)) return;
   $("#view").innerHTML = `<section class="card"><form id="msgForm" class="stack">
     <label>Aluno<select name="recipient_id"><option value="">Todos</option>${state.students.map(s => `<option value="${s.id}">${esc(s.name)}</option>`).join("")}</select></label>
     <label>Assunto<input name="subject" required></label>
@@ -1009,9 +1034,10 @@ async function messages() {
   };
 }
 
-async function studentHome() {
+async function studentHome(seq) {
   setTitle("Meu painel");
   const d = await api("/api/my/dashboard");
+  if (!isCurrentRender(seq)) return;
   const latest = d.evaluations.at(-1);
   $("#view").innerHTML = `
     <section class="grid two">
@@ -1024,20 +1050,23 @@ async function studentHome() {
     </section>`;
 }
 
-async function myqr() {
+async function myqr(seq) {
   setTitle("Meu QR de presença");
   const qr = await api("/api/my/qr");
+  if (!isCurrentRender(seq)) return;
   $("#view").innerHTML = `<section class="card"><h2>Apresente este QR ao estagiário</h2><img class="qr-img" src="${qr.png}" alt="QR de presença"><p class="muted">A equipe pode escanear este QR para registrar sua entrada ou saída na academia.</p><textarea readonly>${qr.payload}</textarea></section>`;
 }
 
-async function myevolution() {
+async function myevolution(seq) {
   setTitle("Minha evolução");
   const d = await api("/api/my/dashboard");
+  if (!isCurrentRender(seq)) return;
   $("#view").innerHTML = `<section class="grid two"><div class="card"><h2>Score QualIA</h2>${chart(d.evaluations, "qualia_score", "Score")}</div><div class="card"><h2>Gordura corporal</h2>${chart(d.evaluations, "body_fat", "% gordura")}</div></section><section class="card" style="margin-top:16px"><h2>Bioimpedâncias</h2>${evalTable(d.evaluations)}</section>`;
 }
 
-async function myeval() {
+async function myeval(seq) {
   setTitle("Nova avaliação");
+  if (!isCurrentRender(seq)) return;
   $("#view").innerHTML = `<section class="card">${evaluationForm(null)}</section>`;
   wireEvaluationForm("#evaluationForm", () => render("student"));
 }
