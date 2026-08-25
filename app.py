@@ -718,6 +718,18 @@ class AttendanceBulkIn(BaseModel):
     records: list[AttendanceItemIn]
 
 
+class AttendanceGridCellIn(BaseModel):
+    session_id: int
+    user_id: int
+    status: str = Field(pattern="^(present|absent|justified)$")
+    minutes: int = Field(default=0, ge=0, le=600)
+    notes: str = ""
+
+
+class AttendanceGridBulkIn(BaseModel):
+    records: list[AttendanceGridCellIn]
+
+
 class AttendanceHistoryIn(BaseModel):
     user_id: int
     start_date: str = Field(min_length=8, max_length=20)
@@ -1823,6 +1835,45 @@ def class_report(class_id: int, _: dict[str, Any] = Depends(require_admin)) -> d
     return {"class": class_row, "summary": summary, "totals": dict(totals)}
 
 
+@app.get("/api/classes/{class_id}/attendance-grid")
+def class_attendance_grid(class_id: int, _: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
+    with connect() as db:
+        class_row = rowdict(get_class_or_404(db, class_id))
+        students = [
+            public_user(dict(r)) for r in db.execute(
+                """
+                SELECT u.* FROM enrollments e
+                JOIN users u ON u.id=e.user_id
+                WHERE e.class_id=? AND u.active=1
+                ORDER BY u.name
+                """,
+                (class_id,),
+            ).fetchall()
+        ]
+        sessions = [dict(r) for r in db.execute(
+            "SELECT * FROM class_sessions WHERE class_id=? ORDER BY session_date",
+            (class_id,),
+        ).fetchall()]
+        rows = db.execute(
+            """
+            SELECT a.session_id, a.user_id, a.status, a.minutes, COALESCE(a.notes, '') notes
+            FROM class_attendance a
+            JOIN class_sessions s ON s.id=a.session_id
+            WHERE s.class_id=?
+            """,
+            (class_id,),
+        ).fetchall()
+        attendance = {
+            f"{row['session_id']}:{row['user_id']}": {
+                "status": row["status"],
+                "minutes": row["minutes"],
+                "notes": row["notes"],
+            }
+            for row in rows
+        }
+    return {"class": class_row, "students": students, "sessions": sessions, "attendance": attendance}
+
+
 @app.post("/api/classes/{class_id}/attendance-history")
 def launch_attendance_history(
     class_id: int,
@@ -1933,6 +1984,46 @@ def save_session_attendance(session_id: int, data: AttendanceBulkIn, _: dict[str
                 (session_id, record.user_id, record.status, minutes, record.notes, now_iso()),
             )
     return {"status": "ok", "saved": len(data.records)}
+
+
+@app.post("/api/classes/{class_id}/attendance-grid")
+def save_class_attendance_grid(class_id: int, data: AttendanceGridBulkIn, _: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
+    with connect() as db:
+        class_row = get_class_or_404(db, class_id)
+        session_ids = {
+            row["id"] for row in db.execute(
+                "SELECT id FROM class_sessions WHERE class_id=?",
+                (class_id,),
+            ).fetchall()
+        }
+        student_ids = {
+            row["user_id"] for row in db.execute(
+                "SELECT user_id FROM enrollments WHERE class_id=?",
+                (class_id,),
+            ).fetchall()
+        }
+        saved = 0
+        for record in data.records:
+            if record.session_id not in session_ids or record.user_id not in student_ids:
+                continue
+            minutes = record.minutes if record.status == "present" else 0
+            if record.status == "present" and minutes == 0:
+                minutes = class_row["default_minutes"]
+            db.execute(
+                """
+                INSERT INTO class_attendance
+                (session_id,user_id,status,minutes,notes,registered_at)
+                VALUES (?,?,?,?,?,?)
+                ON CONFLICT(session_id,user_id) DO UPDATE SET
+                status=excluded.status,
+                minutes=excluded.minutes,
+                notes=excluded.notes,
+                registered_at=excluded.registered_at
+                """,
+                (record.session_id, record.user_id, record.status, minutes, record.notes, now_iso()),
+            )
+            saved += 1
+    return {"status": "ok", "saved": saved}
 
 
 @app.get("/api/certificates/{student_id}", response_class=HTMLResponse)

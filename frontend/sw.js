@@ -1,5 +1,5 @@
-const CACHE = "cafis-academia-v7";
-const ASSETS = ["/", "/style.css?v=5", "/script.js?v=18", "/manifest.webmanifest", "/icon.svg", "/utfpr-logo.svg"];
+const CACHE = "cafis-academia-v8";
+const ASSETS = ["/", "/style.css?v=6", "/script.js?v=19", "/manifest.webmanifest", "/icon.svg", "/utfpr-logo.svg"];
 
 self.addEventListener("install", (event) => {
   event.waitUntil(caches.open(CACHE).then((cache) => cache.addAll(ASSETS)));

@@ -182,6 +182,80 @@ nav button.active {
 table { width: 100%; border-collapse: collapse; min-width: 720px; }
 th, td { text-align: left; border-bottom: 1px solid var(--line); padding: 12px 9px; vertical-align: top; }
 th { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .06em; }
+.attendance-grid-wrap {
+  max-height: 72vh;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: white;
+}
+.attendance-grid-table {
+  min-width: max-content;
+  width: auto;
+  border-collapse: separate;
+  border-spacing: 0;
+}
+.attendance-grid-table th,
+.attendance-grid-table td {
+  padding: 6px;
+  text-align: center;
+  border-right: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+  background: white;
+}
+.attendance-grid-table thead th {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background: #f6faf8;
+}
+.attendance-grid-table .student-name-col {
+  position: sticky;
+  left: 0;
+  z-index: 3;
+  min-width: 220px;
+  max-width: 260px;
+  text-align: left;
+  background: #f6faf8;
+}
+.attendance-grid-table tbody .student-name-col {
+  z-index: 1;
+  text-transform: none;
+  letter-spacing: 0;
+  color: var(--text);
+  font-size: 13px;
+}
+.attendance-grid-table small {
+  display: block;
+  color: var(--muted);
+  font-weight: 600;
+  margin-top: 2px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.att-cell {
+  width: 36px;
+  height: 36px;
+  display: inline-grid;
+  place-items: center;
+  padding: 0;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  font-size: 13px;
+  font-weight: 900;
+}
+.att-cell.present { background: #dff7ea; color: #075b3c; border-color: #91dcb3; }
+.att-cell.absent { background: #fff; color: #8a96a0; border-color: #d7e1db; }
+.att-cell.justified { background: #fff5d6; color: #946200; border-color: #f1cf75; }
+.legend-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 9px 0;
+  color: var(--muted);
+  font-weight: 800;
+}
 .student-list { display: grid; gap: 10px; }
 .student-row {
   display: grid;

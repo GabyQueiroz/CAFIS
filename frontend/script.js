@@ -309,6 +309,17 @@ async function openClass(classId) {
         </form>
       </div>
     </section>
+    <section class="card attendance-sheet-card" style="margin-top:16px">
+      <div class="row" style="justify-content:space-between;margin-bottom:12px">
+        <div>
+          <h2>Planilha de chamada</h2>
+          <p class="muted">Clique nas células para alternar: vazio/falta, presente e justificada. As datas já vêm das aulas geradas.</p>
+        </div>
+        <button id="saveAttendanceGridBtn" class="primary" type="button" disabled>Salvar alterações</button>
+      </div>
+      <div id="attendanceGrid">Carregando chamada...</div>
+      <div id="attendanceGridMsg"></div>
+    </section>
     <section class="grid two" style="margin-top:16px">
       <div class="card">
         <h2>Cadastrar aluno individual</h2>
@@ -323,16 +334,11 @@ async function openClass(classId) {
         </form>
       </div>
       <div class="card">
-        <h2>Presenças retroativas</h2>
-        <p class="muted">Lance presença, falta ou justificativa para um aluno em todas as aulas já geradas dentro de um período.</p>
-        <form id="historyForm" class="stack">
-          <label>Aluno<select name="user_id">${data.students.map(s => `<option value="${s.id}">${esc(s.name)}</option>`).join("")}</select></label>
-          <label>Data inicial<input name="start_date" type="date" value="${esc(data.class.activity_start || "2026-01-01")}" required></label>
-          <label>Data final<input name="end_date" type="date" value="${esc(data.class.activity_end || "2026-12-31")}"></label>
-          <label>Status<select name="status"><option value="present">Presente</option><option value="absent">Falta</option><option value="justified">Justificada</option></select></label>
-          <label>Observação<input name="notes" placeholder="Ex.: lançamento retroativo"></label>
-          <button class="primary">Aplicar no período</button>
-        </form>
+        <h2>Legenda</h2>
+        <p class="muted">Use a planilha acima para lançar várias datas sem abrir chamada por chamada.</p>
+        <div class="legend-row"><span class="att-cell present">P</span> Presente</div>
+        <div class="legend-row"><span class="att-cell absent">F</span> Falta</div>
+        <div class="legend-row"><span class="att-cell justified">J</span> Justificada</div>
       </div>
     </section>
     <section class="grid two" style="margin-top:16px">
@@ -385,14 +391,10 @@ async function openClass(classId) {
     $("#importResult").innerHTML = `<div class="notice">Importação concluída: ${res.created} criado(s), ${res.enrolled} matriculado(s), ${res.failures.length} falha(s).</div>`;
     setTimeout(() => openClass(classId), 1200);
   };
-  $("#historyForm").onsubmit = async (ev) => {
-    ev.preventDefault();
-    const body = Object.fromEntries(new FormData(ev.target).entries());
-    const res = await api(`/api/classes/${classId}/attendance-history`, { method: "POST", body: JSON.stringify(body) });
-    alert(`Lançamento aplicado em ${res.updated_sessions} aula(s).`);
-    openClass(classId);
-  };
   document.querySelectorAll(".open-session-btn").forEach(btn => btn.onclick = () => openSession(Number(btn.dataset.id)));
+  loadAttendanceGrid(classId).catch(err => {
+    $("#attendanceGrid").innerHTML = `<p class="message">Não foi possível carregar a planilha de chamada: ${esc(err.message || err)}</p>`;
+  });
 }
 window.openClass = openClass;
 window.classesView = classesView;
@@ -420,6 +422,82 @@ function fullReportTable(classes) {
       ${classSummaryTable(item.summary)}
     </section>
   `).join("");
+}
+
+async function loadAttendanceGrid(classId) {
+  const grid = await api(`/api/classes/${classId}/attendance-grid`);
+  const changes = new Map();
+  const statusCycle = { absent: "present", present: "justified", justified: "absent" };
+  const statusLabels = { absent: "F", present: "P", justified: "J" };
+  const gridEl = $("#attendanceGrid");
+  const saveBtn = $("#saveAttendanceGridBtn");
+  const msg = $("#attendanceGridMsg");
+  if (!grid.sessions.length) {
+    gridEl.innerHTML = "<p class='muted'>Nenhuma aula gerada para esta turma.</p>";
+    return;
+  }
+  if (!grid.students.length) {
+    gridEl.innerHTML = "<p class='muted'>Nenhum aluno matriculado nesta turma.</p>";
+    return;
+  }
+  gridEl.innerHTML = `
+    <div class="attendance-grid-wrap">
+      <table class="attendance-grid-table">
+        <thead>
+          <tr>
+            <th class="student-name-col">Aluno</th>
+            ${grid.sessions.map(s => `<th title="${esc(s.session_date)}">${shortDate(s.session_date)}</th>`).join("")}
+          </tr>
+        </thead>
+        <tbody>
+          ${grid.students.map(student => `
+            <tr>
+              <th class="student-name-col"><span>${esc(student.name)}</span><small>${esc(student.registration || student.email || "")}</small></th>
+              ${grid.sessions.map(session => {
+                const key = `${session.id}:${student.id}`;
+                const rec = grid.attendance[key] || { status: "absent", minutes: 0, notes: "" };
+                return `<td><button type="button" class="att-cell ${rec.status}" data-session-id="${session.id}" data-user-id="${student.id}" data-status="${rec.status}" title="${esc(student.name)} - ${esc(session.session_date)}">${statusLabels[rec.status]}</button></td>`;
+              }).join("")}
+            </tr>
+          `).join("")}
+        </tbody>
+      </table>
+    </div>`;
+  gridEl.querySelectorAll(".att-cell").forEach(cell => {
+    cell.onclick = () => {
+      const next = statusCycle[cell.dataset.status || "absent"];
+      cell.dataset.status = next;
+      cell.className = `att-cell ${next}`;
+      cell.textContent = statusLabels[next];
+      changes.set(`${cell.dataset.sessionId}:${cell.dataset.userId}`, {
+        session_id: Number(cell.dataset.sessionId),
+        user_id: Number(cell.dataset.userId),
+        status: next,
+        minutes: next === "present" ? Number(grid.class.default_minutes || 60) : 0,
+        notes: "",
+      });
+      saveBtn.disabled = changes.size === 0;
+      msg.innerHTML = `<div class="notice">${changes.size} alteração(ões) pendente(s).</div>`;
+    };
+  });
+  saveBtn.onclick = async () => {
+    if (!changes.size) return;
+    saveBtn.disabled = true;
+    msg.innerHTML = `<div class="notice">Salvando chamada...</div>`;
+    const res = await api(`/api/classes/${classId}/attendance-grid`, {
+      method: "POST",
+      body: JSON.stringify({ records: Array.from(changes.values()) }),
+    });
+    changes.clear();
+    msg.innerHTML = `<div class="notice">Chamada salva: ${res.saved} célula(s) atualizada(s).</div>`;
+    setTimeout(() => openClass(classId), 800);
+  };
+}
+
+function shortDate(value) {
+  const parts = String(value || "").split("-");
+  if (parts.length === 3) return `${parts[2]}/${parts[1]}`;
+  return esc(value || "-");
 }
 
 async function openSession(sessionId) {
