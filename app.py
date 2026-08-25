@@ -23,6 +23,13 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+try:
+    import psycopg
+    from psycopg.rows import dict_row
+except ImportError:  # pragma: no cover - optional outside production deploys
+    psycopg = None
+    dict_row = None
+
 BASE_DIR = Path(__file__).resolve().parent
 
 
@@ -39,6 +46,8 @@ def resolve_db_path() -> Path:
 DB_PATH = resolve_db_path()
 ACTIVE_DB_PATH = DB_PATH
 DB_STORAGE_WARNING = ""
+DATABASE_URL = os.getenv("DATABASE_URL", "")
+DB_BACKEND = "postgres" if DATABASE_URL else "sqlite"
 FRONTEND_DIR = BASE_DIR / "frontend"
 UTC = timezone.utc
 COOKIE_NAME = "cafis_session"
@@ -55,7 +64,99 @@ def now_iso() -> str:
     return datetime.now(UTC).replace(microsecond=0).isoformat()
 
 
+def pg_placeholders(sql: str) -> str:
+    pieces: list[str] = []
+    in_single = False
+    in_double = False
+    for ch in sql:
+        if ch == "'" and not in_double:
+            in_single = not in_single
+        elif ch == '"' and not in_single:
+            in_double = not in_double
+        if ch == "?" and not in_single and not in_double:
+            pieces.append("%s")
+        else:
+            pieces.append(ch)
+    return "".join(pieces)
+
+
+def pg_sql(sql: str, return_id: bool = False) -> str:
+    text = sql.strip()
+    text = re.sub(r"\bINTEGER\s+PRIMARY\s+KEY\s+AUTOINCREMENT\b", "SERIAL PRIMARY KEY", text, flags=re.I)
+    text = re.sub(r"\bINSERT\s+OR\s+IGNORE\s+INTO\b", "INSERT INTO", text, flags=re.I)
+    text = re.sub(
+        r"strftime\('%s','now'\)\s*\+\s*\?",
+        "(EXTRACT(EPOCH FROM NOW())::integer + ?)",
+        text,
+        flags=re.I,
+    )
+    text = pg_placeholders(text)
+    if re.match(r"^INSERT\s+INTO\s+", text, flags=re.I) and "ON CONFLICT" not in text.upper() and return_id:
+        text = f"{text} RETURNING id"
+    if re.search(r"^INSERT\s+INTO\s+", text, flags=re.I) and "INSERT OR IGNORE" not in sql.upper() and "ON CONFLICT" not in text.upper():
+        return text
+    if "INSERT OR IGNORE" in sql.upper() and "ON CONFLICT" not in text.upper():
+        text = f"{text} ON CONFLICT DO NOTHING"
+    return text
+
+
+class DbCursor:
+    def __init__(self, cursor: Any, lastrowid: int | None = None):
+        self.cursor = cursor
+        self.lastrowid = lastrowid
+
+    def fetchone(self) -> Any:
+        return self.cursor.fetchone()
+
+    def fetchall(self) -> list[Any]:
+        return self.cursor.fetchall()
+
+
+class PostgresDb:
+    id_tables = {
+        "users", "evaluations", "attendance", "equipment", "workout_plans", "messages",
+        "programs", "class_groups", "enrollments", "class_sessions", "class_attendance",
+    }
+
+    def __init__(self) -> None:
+        if psycopg is None or dict_row is None:
+            raise RuntimeError("Dependência psycopg não instalada para usar DATABASE_URL.")
+        self.conn = psycopg.connect(DATABASE_URL, row_factory=dict_row)
+        self.total_changes = 0
+
+    def __enter__(self) -> "PostgresDb":
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        if exc_type:
+            self.conn.rollback()
+        else:
+            self.conn.commit()
+        self.conn.close()
+
+    def execute(self, sql: str, params: tuple[Any, ...] = ()) -> DbCursor:
+        stripped = sql.strip()
+        table_match = re.match(r"INSERT\s+(?:OR\s+IGNORE\s+)?INTO\s+([a-z_]+)", stripped, flags=re.I)
+        return_id = bool(table_match and table_match.group(1).lower() in self.id_tables and "OR IGNORE" not in stripped.upper())
+        query = pg_sql(sql, return_id=return_id)
+        cur = self.conn.execute(query, params)
+        lastrowid = None
+        if return_id:
+            row = cur.fetchone()
+            lastrowid = row["id"] if row else None
+            self.total_changes += 1 if lastrowid else 0
+        elif stripped.upper().startswith(("INSERT", "UPDATE", "DELETE")):
+            self.total_changes += max(cur.rowcount or 0, 0)
+        return DbCursor(cur, lastrowid)
+
+    def executescript(self, script: str) -> None:
+        for statement in [item.strip() for item in script.split(";") if item.strip()]:
+            self.execute(statement)
+
+
 def connect() -> sqlite3.Connection:
+    if DB_BACKEND == "postgres":
+        return PostgresDb()
     global ACTIVE_DB_PATH, DB_STORAGE_WARNING
     db_path = DB_PATH
     try:
@@ -357,62 +458,63 @@ def init_db() -> None:
                     "INSERT INTO programs (name, slug, description, created_at) VALUES (?, ?, ?, ?)",
                     (name, slug, description, now_iso()),
                 )
-        eval_cols = db.execute("PRAGMA table_info(evaluations)").fetchall()
-        eval_info = {row["name"]: row for row in eval_cols}
-        weight_col = eval_info.get("weight")
-        height_col = eval_info.get("height_cm")
-        needs_eval_rebuild = (
-            "evaluation_type" not in eval_info
-            or bool(weight_col["notnull"] if weight_col else False)
-            or bool(height_col["notnull"] if height_col else False)
-        )
-        if needs_eval_rebuild:
-            db.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS evaluations_new (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                    evaluation_type TEXT NOT NULL DEFAULT 'completa',
-                    created_at TEXT NOT NULL,
-                    weight REAL,
-                    height_cm REAL,
-                    body_fat REAL,
-                    body_water REAL,
-                    muscle_mass REAL,
-                    bmr REAL,
-                    metabolic_age REAL,
-                    bone_mass REAL,
-                    visceral_fat REAL,
-                    waist_cm REAL,
-                    hip_cm REAL,
-                    flexibility_cm REAL,
-                    abdominal_reps INTEGER,
-                    pushup_reps INTEGER,
-                    resting_hr INTEGER,
-                    post_hr INTEGER,
-                    recovery_hr_5min INTEGER,
-                    cooper_km REAL,
-                    vo2max REAL,
-                    systolic INTEGER,
-                    diastolic INTEGER,
-                    qualia_score REAL NOT NULL,
-                    risk_level TEXT NOT NULL,
-                    recommendations TEXT NOT NULL,
-                    notes TEXT DEFAULT ''
-                );
-                INSERT INTO evaluations_new
-                (id,user_id,evaluation_type,created_at,weight,height_cm,body_fat,body_water,muscle_mass,bmr,metabolic_age,bone_mass,visceral_fat,
-                 waist_cm,hip_cm,flexibility_cm,abdominal_reps,pushup_reps,resting_hr,post_hr,recovery_hr_5min,cooper_km,
-                 vo2max,systolic,diastolic,qualia_score,risk_level,recommendations,notes)
-                SELECT id,user_id,'completa',created_at,weight,height_cm,body_fat,body_water,muscle_mass,bmr,metabolic_age,bone_mass,visceral_fat,
-                 waist_cm,hip_cm,flexibility_cm,abdominal_reps,pushup_reps,resting_hr,post_hr,recovery_hr_5min,cooper_km,
-                 vo2max,systolic,diastolic,qualia_score,risk_level,recommendations,notes
-                FROM evaluations;
-                DROP TABLE evaluations;
-                ALTER TABLE evaluations_new RENAME TO evaluations;
-                """
+        if DB_BACKEND == "sqlite":
+            eval_cols = db.execute("PRAGMA table_info(evaluations)").fetchall()
+            eval_info = {row["name"]: row for row in eval_cols}
+            weight_col = eval_info.get("weight")
+            height_col = eval_info.get("height_cm")
+            needs_eval_rebuild = (
+                "evaluation_type" not in eval_info
+                or bool(weight_col["notnull"] if weight_col else False)
+                or bool(height_col["notnull"] if height_col else False)
             )
-        for sql in [
+            if needs_eval_rebuild:
+                db.executescript(
+                    """
+                    CREATE TABLE IF NOT EXISTS evaluations_new (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                        evaluation_type TEXT NOT NULL DEFAULT 'completa',
+                        created_at TEXT NOT NULL,
+                        weight REAL,
+                        height_cm REAL,
+                        body_fat REAL,
+                        body_water REAL,
+                        muscle_mass REAL,
+                        bmr REAL,
+                        metabolic_age REAL,
+                        bone_mass REAL,
+                        visceral_fat REAL,
+                        waist_cm REAL,
+                        hip_cm REAL,
+                        flexibility_cm REAL,
+                        abdominal_reps INTEGER,
+                        pushup_reps INTEGER,
+                        resting_hr INTEGER,
+                        post_hr INTEGER,
+                        recovery_hr_5min INTEGER,
+                        cooper_km REAL,
+                        vo2max REAL,
+                        systolic INTEGER,
+                        diastolic INTEGER,
+                        qualia_score REAL NOT NULL,
+                        risk_level TEXT NOT NULL,
+                        recommendations TEXT NOT NULL,
+                        notes TEXT DEFAULT ''
+                    );
+                    INSERT INTO evaluations_new
+                    (id,user_id,evaluation_type,created_at,weight,height_cm,body_fat,body_water,muscle_mass,bmr,metabolic_age,bone_mass,visceral_fat,
+                     waist_cm,hip_cm,flexibility_cm,abdominal_reps,pushup_reps,resting_hr,post_hr,recovery_hr_5min,cooper_km,
+                     vo2max,systolic,diastolic,qualia_score,risk_level,recommendations,notes)
+                    SELECT id,user_id,'completa',created_at,weight,height_cm,body_fat,body_water,muscle_mass,bmr,metabolic_age,bone_mass,visceral_fat,
+                     waist_cm,hip_cm,flexibility_cm,abdominal_reps,pushup_reps,resting_hr,post_hr,recovery_hr_5min,cooper_km,
+                     vo2max,systolic,diastolic,qualia_score,risk_level,recommendations,notes
+                    FROM evaluations;
+                    DROP TABLE evaluations;
+                    ALTER TABLE evaluations_new RENAME TO evaluations;
+                    """
+                )
+        alter_statements = [
             "ALTER TABLE equipment ADD COLUMN quantity INTEGER NOT NULL DEFAULT 1",
             "ALTER TABLE equipment ADD COLUMN photo_data_url TEXT DEFAULT ''",
             "ALTER TABLE class_groups ADD COLUMN weekday TEXT DEFAULT ''",
@@ -424,7 +526,10 @@ def init_db() -> None:
             "ALTER TABLE class_groups ADD COLUMN period_label TEXT DEFAULT ''",
             "ALTER TABLE class_groups ADD COLUMN source_file TEXT DEFAULT ''",
             "ALTER TABLE class_groups ADD COLUMN event_code TEXT DEFAULT ''",
-        ]:
+        ]
+        for sql in alter_statements:
+            if DB_BACKEND == "postgres":
+                sql = sql.replace("ADD COLUMN", "ADD COLUMN IF NOT EXISTS")
             try:
                 db.execute(sql)
             except sqlite3.OperationalError:
@@ -467,13 +572,23 @@ def startup() -> None:
 
 @app.get("/api/health")
 def health() -> dict[str, Any]:
+    if DB_BACKEND == "postgres":
+        return {
+            "status": "ok",
+            "database_backend": DB_BACKEND,
+            "database_url_configured": bool(DATABASE_URL),
+            "persistent_database": True,
+            "storage_warning": "",
+        }
     return {
         "status": "ok",
+        "database_backend": DB_BACKEND,
+        "database_url_configured": bool(DATABASE_URL),
         "configured_database_path": str(DB_PATH),
         "database_path": str(ACTIVE_DB_PATH),
         "database_exists": ACTIVE_DB_PATH.exists(),
         "database_parent_exists": ACTIVE_DB_PATH.parent.exists(),
-        "persistent_database": str(ACTIVE_DB_PATH).startswith("/var/data"),
+        "persistent_database": DB_BACKEND == "postgres" or str(ACTIVE_DB_PATH).startswith("/var/data"),
         "storage_warning": DB_STORAGE_WARNING,
     }
 

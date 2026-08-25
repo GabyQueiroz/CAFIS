@@ -221,6 +221,7 @@ O projeto já lê as seguintes variáveis:
 ```text
 CAFIS_DB_PATH
 CAFIS_FALLBACK_DB_PATH
+DATABASE_URL
 CAFIS_COOKIE_SECURE
 CAFIS_ADMIN_EMAIL
 CAFIS_ADMIN_PASSWORD
@@ -238,7 +239,7 @@ CAFIS_SMTP_FROM
 ```text
 CAFIS_ADMIN_EMAIL=seu-email@utfpr.edu.br
 CAFIS_ADMIN_PASSWORD=uma-senha-forte
-CAFIS_DB_PATH=/data/cafis_academia.db
+DATABASE_URL=postgresql://usuario:senha@host/database?sslmode=require
 CAFIS_COOKIE_SECURE=1
 CAFIS_SMTP_HOST=smtp.exemplo.com
 CAFIS_SMTP_PORT=587
