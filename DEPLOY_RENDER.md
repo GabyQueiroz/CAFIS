@@ -29,6 +29,13 @@ Este sistema usa SQLite. No Render, dados locais só persistem se houver **Persi
 
 O `render.yaml` já configura um disco de 1 GB em `/var/data`, mas discos persistentes exigem plano pago. No plano free, o banco pode ser perdido em redeploy/restart.
 
+Depois do deploy, abra `/api/health` e confirme:
+
+- `persistent_database` deve estar como `true`.
+- `database_path` deve ser `/var/data/cafis_academia.db`.
+
+Se o healthcheck mostrar outro caminho, crie/ative o disco persistente no Render ou defina `CAFIS_DB_PATH=/var/data/cafis_academia.db`.
+
 ## Segurança antes de usar com alunos reais
 
 - Use uma senha forte no `CAFIS_ADMIN_PASSWORD`.

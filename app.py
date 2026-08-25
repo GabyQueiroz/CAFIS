@@ -24,7 +24,19 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = Path(os.getenv("CAFIS_DB_PATH", BASE_DIR / "cafis_academia.db"))
+
+
+def resolve_db_path() -> Path:
+    configured = os.getenv("CAFIS_DB_PATH")
+    if configured:
+        return Path(configured)
+    render_disk = Path("/var/data")
+    if render_disk.exists():
+        return render_disk / "cafis_academia.db"
+    return BASE_DIR / "cafis_academia.db"
+
+
+DB_PATH = resolve_db_path()
 FRONTEND_DIR = BASE_DIR / "frontend"
 UTC = timezone.utc
 COOKIE_NAME = "cafis_session"
@@ -45,8 +57,11 @@ def connect() -> sqlite3.Connection:
     db_path = DB_PATH
     try:
         db_path.parent.mkdir(parents=True, exist_ok=True)
-    except PermissionError:
-        db_path = Path(os.getenv("CAFIS_FALLBACK_DB_PATH", "/tmp/cafis_academia.db"))
+    except PermissionError as exc:
+        fallback = os.getenv("CAFIS_FALLBACK_DB_PATH")
+        if os.getenv("CAFIS_DB_PATH") or str(DB_PATH).startswith("/var/data") or not fallback:
+            raise RuntimeError(f"Sem permissao para gravar o banco em {DB_PATH}") from exc
+        db_path = Path(fallback)
         db_path.parent.mkdir(parents=True, exist_ok=True)
         print(f"WARNING: sem permissao para {DB_PATH}; usando banco temporario em {db_path}")
     conn = sqlite3.connect(db_path)
@@ -445,8 +460,14 @@ def startup() -> None:
 
 
 @app.get("/api/health")
-def health() -> dict[str, str]:
-    return {"status": "ok"}
+def health() -> dict[str, Any]:
+    return {
+        "status": "ok",
+        "database_path": str(DB_PATH),
+        "database_exists": DB_PATH.exists(),
+        "database_parent_exists": DB_PATH.parent.exists(),
+        "persistent_database": str(DB_PATH).startswith("/var/data"),
+    }
 
 
 class LoginIn(BaseModel):
